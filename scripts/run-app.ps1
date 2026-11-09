@@ -9,6 +9,12 @@ param(
 $ErrorActionPreference = "Continue"
 $root = Split-Path -Parent $PSScriptRoot
 
+# Ollama's OpenAI-compatible endpoint cannot set num_ctx per request. Raise the
+# server default so the system prompt, résumé and screenshot image tokens are
+# not silently truncated from the front. 16384 covers a long transcript plus
+# context and one 1600x900 screenshot. Only affects Ollama started below.
+$env:OLLAMA_CONTEXT_LENGTH = '16384'
+
 function Test-Url([string]$url) {
   try { Invoke-WebRequest -Uri $url -TimeoutSec 2 -UseBasicParsing | Out-Null; return $true } catch { return $false }
 }

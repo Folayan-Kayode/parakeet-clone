@@ -1,6 +1,6 @@
 {
   "name": "parakeet-clone",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Local-first interview copilot overlay (independent reimplementation)",
   "main": "./out/main/index.js",
   "author": "Davel",

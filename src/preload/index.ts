@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from 'electron'
-import type { AppConfig, ChatRequest } from '../shared/types'
+import type { AppConfig, CaptureTestReport, ChatRequest, HotkeyInfo } from '../shared/types'
 
 const api = {
   getConfig: (): Promise<AppConfig> => ipcRenderer.invoke('config:get'),
@@ -13,15 +13,19 @@ const api = {
   quit: (): Promise<void> => ipcRenderer.invoke('win:quit'),
   appInfo: (): Promise<{ version: string; platform: string; configPath: string }> =>
     ipcRenderer.invoke('app:info'),
+  getHotkeys: (): Promise<HotkeyInfo[]> => ipcRenderer.invoke('hotkeys:list'),
   saveSession: (payload: unknown): Promise<string | null> =>
     ipcRenderer.invoke('session:save', payload),
   captureScreen: (): Promise<string> => ipcRenderer.invoke('shot:capture'),
+  captureRegionSource: (): Promise<{ dataUrl: string; displayId: number }> =>
+    ipcRenderer.invoke('shot:capture-source'),
   transcribe: (wav: ArrayBuffer, prompt?: string): Promise<{ text: string }> =>
     ipcRenderer.invoke('asr:transcribe', { wav, prompt }),
   testAsr: (): Promise<{ ok: boolean; text?: string; error?: string }> =>
     ipcRenderer.invoke('test:asr'),
   testLlm: (): Promise<{ ok: boolean; text?: string; error?: string }> =>
     ipcRenderer.invoke('test:llm'),
+  testCapture: (): Promise<CaptureTestReport> => ipcRenderer.invoke('test:capture'),
   listDisplays: (): Promise<
     Array<{ id: number; label: string; primary: boolean; bounds: { x: number; y: number; width: number; height: number } }>
   > => ipcRenderer.invoke('displays:list'),
@@ -33,6 +37,7 @@ const api = {
   getSession: (name: string): Promise<unknown> => ipcRenderer.invoke('sessions:get', name),
   deleteSession: (name: string): Promise<boolean> => ipcRenderer.invoke('sessions:delete', name),
   deleteAllSessions: (): Promise<number> => ipcRenderer.invoke('sessions:delete-all'),
+  exportSession: (name: string): Promise<string> => ipcRenderer.invoke('sessions:export', name),
   checkForUpdates: (): Promise<{ ok: boolean; version?: string | null; error?: string }> =>
     ipcRenderer.invoke('updates:check'),
   installUpdate: (): Promise<void> => ipcRenderer.invoke('updates:install'),
@@ -48,6 +53,16 @@ const api = {
     const handler = (_e: unknown, name: string): void => cb(name)
     ipcRenderer.on('hotkey', handler as never)
     return () => ipcRenderer.removeListener('hotkey', handler as never)
+  },
+  onCapturedImage: (
+    cb: (payload: { dataUrl?: string; hint?: string; error?: string }) => void
+  ): (() => void) => {
+    const handler = (
+      _e: unknown,
+      payload: { dataUrl?: string; hint?: string; error?: string }
+    ): void => cb(payload)
+    ipcRenderer.on('shot:image', handler as never)
+    return () => ipcRenderer.removeListener('shot:image', handler as never)
   },
   onConfigChanged: (cb: (config: AppConfig) => void): (() => void) => {
     const handler = (_e: unknown, config: AppConfig): void => cb(config)

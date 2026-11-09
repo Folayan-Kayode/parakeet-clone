@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { ChangeEvent } from 'react'
-import type { AppConfig, ChatMessage } from '../../shared/types'
+import type { ChangeEvent, PointerEvent as ReactPointerEvent } from 'react'
+import type {
+  AppConfig,
+  CaptureTestCheck,
+  CaptureTestReport,
+  ChatMessage,
+  HotkeyInfo
+} from '../../shared/types'
 import {
   AudioEngine,
   startMicStream,
@@ -32,7 +38,7 @@ function clip(text: string, max: number): string {
   return t.length > max ? `${t.slice(0, max)}…` : t
 }
 
-function buildSystemPrompt(cfg: AppConfig): string {
+function buildSystemPrompt(cfg: AppConfig, hasImageAttachment: boolean): string {
   const a = cfg.answer
   const lengthRule =
     a.length === 'concise'
@@ -76,6 +82,19 @@ function buildSystemPrompt(cfg: AppConfig): string {
     .filter(Boolean)
     .join('\n\n')
 
+  // Image turns only: an output protocol that overrides the spoken style for
+  // screenshots. Kept last so it is the most recent instruction; the global
+  // rules above (first person, never mention being an AI) still apply.
+  const imageRule = hasImageAttachment
+    ? [
+        'An image is attached to this question. Read it completely before answering.',
+        `- If the image contains a programming/coding problem: open with at most a 1-2 sentence first-person approach summary (spoken style), then IMMEDIATELY give the complete, correct, runnable solution in ONE code block in ${a.codeLanguage}. No trailing questions, no "want me to..." offers, no meta commentary, no restating the problem. If the approach is trivial, the code block can be the whole answer.`,
+        '- Else if the image is a multiple-choice question: state the selected answer (letter + text) FIRST, then at most one short line of justification.',
+        '- Else: fall back to the normal spoken-answer style.',
+        'These image rules take precedence over the Style word budget above.'
+      ].join('\n')
+    : ''
+
   return [
     "You are the user's live interview copilot. Your job: give a direct, speakable answer to the latest question in the call transcript.",
     'Rules:',
@@ -86,13 +105,52 @@ function buildSystemPrompt(cfg: AppConfig): string {
     `Style: ${lengthRule} ${formatRule} ${toneRule} ${fillerRule}`,
     starRule,
     session && `Session context:\n${session}`,
-    profile && `About the candidate:\n${profile}`
+    profile && `About the candidate:\n${profile}`,
+    imageRule
   ]
     .filter(Boolean)
     .join('\n')
 }
 
 const MAX_SEGMENTS = 200
+
+// Queued follow-ups older than this are stale for a live interview and dropped.
+const QUEUE_TTL_MS = 60_000
+
+function formatAccelerator(accelerator: string): string {
+  return accelerator.replace(/CommandOrControl/g, 'Ctrl')
+}
+
+// Settings presets only patch the draft: the user still reviews and saves.
+// The model is intentionally never changed here.
+function applyPreset(cfg: AppConfig, preset: 'behavioral' | 'coding'): AppConfig {
+  if (preset === 'behavioral') {
+    return {
+      ...cfg,
+      llm: { ...cfg.llm, reasoningEffort: 'low' },
+      answer: {
+        ...cfg.answer,
+        length: 'balanced',
+        format: 'paragraph',
+        tone: 'casual',
+        star: true,
+        fillerWords: true
+      }
+    }
+  }
+  return {
+    ...cfg,
+    llm: { ...cfg.llm, reasoningEffort: 'high' },
+    answer: {
+      ...cfg.answer,
+      length: 'concise',
+      format: 'bullets',
+      tone: 'simple',
+      star: false,
+      fillerWords: false
+    }
+  }
+}
 
 function errorMessage(err: unknown): string {
   if (err instanceof Error) return err.message
@@ -104,6 +162,56 @@ function errorMessage(err: unknown): string {
     /* ignore */
   }
   return text
+}
+
+async function runRendererCaptureChecks(): Promise<CaptureTestCheck[]> {
+  const checks: CaptureTestCheck[] = []
+
+  let loopback: MediaStream | null = null
+  try {
+    loopback = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true })
+    const ok = loopback.getAudioTracks().length > 0
+    checks.push({
+      id: 'silent-loopback',
+      label: 'Loopback audio (no picker)',
+      pass: ok,
+      detail: ok
+        ? 'loopback audio captured with no picker/prompt'
+        : 'getDisplayMedia resolved but provided no audio track'
+    })
+  } catch (err) {
+    checks.push({
+      id: 'silent-loopback',
+      label: 'Loopback audio (no picker)',
+      pass: false,
+      detail: errorMessage(err)
+    })
+  } finally {
+    loopback?.getTracks().forEach((track) => track.stop())
+  }
+
+  let mic: MediaStream | null = null
+  const micLabel = "Mic access (optional — needed only for the 'You' channel)"
+  try {
+    mic = await navigator.mediaDevices.getUserMedia({ audio: true })
+    checks.push({
+      id: 'mic-access',
+      label: micLabel,
+      pass: true,
+      detail: 'microphone opened successfully'
+    })
+  } catch (err) {
+    checks.push({
+      id: 'mic-access',
+      label: micLabel,
+      pass: null,
+      detail: `optional — ${errorMessage(err)}`
+    })
+  } finally {
+    mic?.getTracks().forEach((track) => track.stop())
+  }
+
+  return checks
 }
 
 const HALLUCINATIONS = new Set([
@@ -199,6 +307,11 @@ export default function App() {
   const [pendingDelete, setPendingDelete] = useState<string | null>(null)
   const [pendingDeleteAll, setPendingDeleteAll] = useState(false)
   const [updateReady, setUpdateReady] = useState<{ version: string } | null>(null)
+  const [regionShot, setRegionShot] = useState<{ dataUrl: string; displayId: number } | null>(null)
+  const [regionSel, setRegionSel] = useState<{ x: number; y: number; w: number; h: number } | null>(
+    null
+  )
+  const [regionSaving, setRegionSaving] = useState(false)
 
   const engines = useRef<{ you?: AudioEngine; them?: AudioEngine } | null>(null)
   const chains = useRef<Record<Speaker, Promise<void>>>({ You: Promise.resolve(), Them: Promise.resolve() })
@@ -210,21 +323,28 @@ export default function App() {
     You: { uid: -1, applied: 0, finalizing: false },
     Them: { uid: -1, applied: 0, finalizing: false }
   })
-  const lastEarlyUid = useRef<Record<Speaker, number>>({ You: -1, Them: -1 })
   const streaming = useRef(false)
   const lastAnswerAt = useRef(0)
+  const pendingAsks = useRef<Array<{ question: string; anchorUid: number; queuedAt: number }>>([])
+  const askedUids = useRef<Set<number>>(new Set())
   const configRef = useRef<AppConfig | null>(null)
   const segmentsRef = useRef<Segment[]>([])
   const answersRef = useRef<Answer[]>([])
   const promptRef = useRef<Record<Speaker, string>>({ You: '', Them: '' })
   const titleRef = useRef(title)
-  const askRef = useRef<(question?: string, anchorUid?: number) => void>(() => undefined)
+  const askRef = useRef<(question?: string, anchorUid?: number, useAttachments?: boolean) => void>(
+    () => undefined
+  )
   const shotRef = useRef<() => void>(() => undefined)
   const beginRef = useRef<() => void>(() => undefined)
   const listeningRef = useRef(false)
   const composerRef = useRef<HTMLTextAreaElement | null>(null)
-  const toastTimer = useRef<number | null>(null)
   const scrollRef = useRef<HTMLDivElement | null>(null)
+  const atBottomRef = useRef(true)
+  const queueTimer = useRef<number | null>(null)
+  const regionDrag = useRef<{ startX: number; startY: number; rect: DOMRect } | null>(null)
+  const regionImgRef = useRef<HTMLImageElement | null>(null)
+  const toastTimer = useRef<number | null>(null)
 
   configRef.current = config
   titleRef.current = title
@@ -288,6 +408,14 @@ export default function App() {
     return off
   }, [])
 
+  // Sticky-bottom: follow new content only while the reader is already at the
+  // bottom; scrolling up pauses following until they return to the bottom.
+  useEffect(() => {
+    if (!configRef.current?.interaction.autoScroll || !atBottomRef.current) return
+    const el = scrollRef.current
+    if (el) el.scrollTop = el.scrollHeight
+  }, [segments, answers])
+
   useEffect(() => {
     if (!pendingDelete && !pendingDeleteAll) return
     const timer = window.setTimeout(() => {
@@ -315,13 +443,9 @@ export default function App() {
     return () => {
       engines.current?.you?.stop()
       engines.current?.them?.stop()
+      if (queueTimer.current) window.clearTimeout(queueTimer.current)
     }
   }, [])
-
-  useEffect(() => {
-    const el = scrollRef.current
-    if (el) el.scrollTop = el.scrollHeight
-  }, [segments, answers])
 
   const removePartial = useCallback((id: string) => {
     setSegments((prev) => {
@@ -331,6 +455,40 @@ export default function App() {
       return next
     })
   }, [])
+
+  // Dispatch the oldest fresh queued follow-up; the caller ensures the stream is free.
+  const dispatchQueuedAsk = useCallback(() => {
+    if (streaming.current) return
+    const now = Date.now()
+    let next = pendingAsks.current.shift()
+    while (next && now - next.queuedAt > QUEUE_TTL_MS) next = pendingAsks.current.shift()
+    if (next) askRef.current(next.question, next.anchorUid, false)
+  }, [])
+
+  // Cap the follow-up queue at the two most recent entries; mark the uid at
+  // enqueue time so an early partial and the final segment never both queue it.
+  const queueAsk = useCallback(
+    (question: string, anchorUid: number) => {
+      const now = Date.now()
+      pendingAsks.current = pendingAsks.current
+        .filter((entry) => now - entry.queuedAt <= QUEUE_TTL_MS)
+        .concat({ question, anchorUid, queuedAt: now })
+      if (pendingAsks.current.length > 2) pendingAsks.current = pendingAsks.current.slice(-2)
+      // A question can also be queued because the cooldown (not an active
+      // stream) blocked it; schedule the drain for when the cooldown elapses so
+      // it is not stranded until some later ask happens to free the lock.
+      if (!streaming.current) {
+        const cooldown = configRef.current?.interaction.answerCooldownMs ?? 0
+        const wait = Math.max(0, cooldown - (Date.now() - lastAnswerAt.current))
+        if (queueTimer.current) window.clearTimeout(queueTimer.current)
+        queueTimer.current = window.setTimeout(() => {
+          queueTimer.current = null
+          dispatchQueuedAsk()
+        }, wait)
+      }
+    },
+    [dispatchQueuedAsk]
+  )
 
   const appendSegment = useCallback(
     (speaker: Speaker, text: string, partialId?: string, utteranceId = -1) => {
@@ -380,15 +538,21 @@ export default function App() {
       if (
         speaker === 'Them' &&
         cfg?.interaction.autoAnswer &&
-        utteranceId !== lastEarlyUid.current[speaker] &&
         isQuestion(clean) &&
-        !streaming.current &&
-        Date.now() - lastAnswerAt.current >= cfg.interaction.answerCooldownMs
+        !askedUids.current.has(utteranceId)
       ) {
-        askRef.current(clean, utteranceId)
+        askedUids.current.add(utteranceId)
+        if (
+          !streaming.current &&
+          Date.now() - lastAnswerAt.current >= cfg.interaction.answerCooldownMs
+        ) {
+          askRef.current(clean, utteranceId)
+        } else {
+          queueAsk(clean, utteranceId)
+        }
       }
     },
-    []
+    [queueAsk]
   )
 
   const handlePartial = useCallback(
@@ -429,14 +593,19 @@ export default function App() {
             speaker === 'Them' &&
             cfg?.interaction.autoAnswer &&
             cfg.interaction.earlyAnswer &&
-            lastEarlyUid.current[speaker] !== uid &&
-            looksCompleteQuestion(clean) &&
-            !streaming.current &&
-            Date.now() - lastAnswerAt.current >= cfg.interaction.answerCooldownMs
+            !askedUids.current.has(uid) &&
+            looksCompleteQuestion(clean)
           ) {
-            lastEarlyUid.current[speaker] = uid
-            console.log('[early-answer]', clean)
-            askRef.current(clean, uid)
+            askedUids.current.add(uid)
+            if (
+              !streaming.current &&
+              Date.now() - lastAnswerAt.current >= cfg.interaction.answerCooldownMs
+            ) {
+              console.log('[early-answer]', clean)
+              askRef.current(clean, uid)
+            } else {
+              queueAsk(clean, uid)
+            }
           }
         })
         .catch(() => undefined)
@@ -444,7 +613,7 @@ export default function App() {
           partialBusy.current[speaker] = false
         })
     },
-    []
+    [queueAsk]
   )
 
   const onWav = useCallback(
@@ -512,6 +681,12 @@ export default function App() {
         ...prev.filter((a) => a.id !== id).slice(-9),
         { id, text: '', streaming: true, question, transcript, anchorId }
       ])
+      // Outgoing images for this ask: none for regenerate, and none over IPC
+      // when vision is off (main would drop them anyway). The model only sees
+      // images when vision is enabled.
+      const images =
+        opts?.useAttachments === false || !cfg.llm.vision ? [] : attachments
+      const hasImageAttachment = images.length > 0
       const userContent = [
         `Session: ${titleRef.current}`,
         '',
@@ -521,11 +696,13 @@ export default function App() {
         question ? `User question: ${question}` : 'Answer the latest question from the transcript.'
       ].join('\n')
       const messages: ChatMessage[] = [
-        { role: 'system', content: buildSystemPrompt(cfg) },
+        { role: 'system', content: buildSystemPrompt(cfg, hasImageAttachment) },
         ...assistantTurns,
         { role: 'user', content: userContent }
       ]
-      const images = opts?.useAttachments === false ? [] : attachments
+      // Attachments are consumed by this send and cleared from the composer.
+      // Regenerating an old answer therefore cannot resend its original images
+      // (acceptable tradeoff; avoids silently attaching stale screenshots).
       setAttachments([])
       try {
         await window.api.chat({
@@ -540,9 +717,12 @@ export default function App() {
         streaming.current = false
         lastAnswerAt.current = Date.now()
         setAnswers((prev) => prev.map((a) => (a.id === id ? { ...a, streaming: false } : a)))
+        // Queued follow-ups bypass the cooldown: one ask per uid already gates
+        // repeats, and the question is already stale by the time the lock frees.
+        dispatchQueuedAsk()
       }
     },
-    [attachments, showToast]
+    [attachments, showToast, dispatchQueuedAsk]
   )
 
   const regenerate = useCallback(
@@ -559,27 +739,143 @@ export default function App() {
     [ask]
   )
 
-  askRef.current = (question?: string, anchorUid?: number) => {
-    void ask({ question, anchorUid })
+  askRef.current = (question?: string, anchorUid?: number, useAttachments?: boolean) => {
+    void ask({ question, anchorUid, useAttachments })
   }
+
+  const attachImage = useCallback(
+    (dataUrl: string, hint?: string) => {
+      setAttachments((prev) => [...prev.slice(0, 9), dataUrl])
+      const guidance = configRef.current?.llm.vision
+        ? 'Screenshot attached — press Answer to include it'
+        : 'Screenshot attached — enable "Model supports images" in Settings to send it'
+      showToast(hint ? `${guidance} (${hint})` : guidance)
+    },
+    [showToast]
+  )
 
   const captureShot = useCallback(async () => {
     try {
-      const dataUrl = await window.api.captureScreen()
-      setAttachments((prev) => [...prev.slice(0, 9), dataUrl])
-      showToast(
-        configRef.current?.llm.vision
-          ? 'Screenshot attached — press Answer to include it'
-          : 'Screenshot attached — enable "Model supports images" in Settings to send it'
-      )
+      attachImage(await window.api.captureScreen())
     } catch (err) {
       setError(errorMessage(err))
     }
-  }, [showToast])
+  }, [attachImage])
 
   shotRef.current = () => {
     void captureShot()
   }
+
+  // Region screenshots arrive already cropped from main (shot:image).
+  useEffect(() => {
+    const off = window.api.onCapturedImage(({ dataUrl, hint, error }) => {
+      if (error) {
+        setError(error)
+        return
+      }
+      if (dataUrl) attachImage(dataUrl, hint)
+    })
+    return off
+  }, [attachImage])
+
+  const openRegionPicker = useCallback(async () => {
+    try {
+      const shot = await window.api.captureRegionSource()
+      regionDrag.current = null
+      setRegionSel(null)
+      setRegionShot(shot)
+    } catch (err) {
+      setError(errorMessage(err))
+    }
+  }, [])
+
+  const closeRegionPicker = useCallback(() => {
+    regionDrag.current = null
+    setRegionSel(null)
+    setRegionShot(null)
+  }, [])
+
+  useEffect(() => {
+    if (!regionShot) return
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') closeRegionPicker()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [regionShot, closeRegionPicker])
+
+  const startRegionDrag = useCallback((e: ReactPointerEvent<HTMLImageElement>) => {
+    const rect = e.currentTarget.getBoundingClientRect()
+    const startX = Math.min(Math.max(e.clientX - rect.left, 0), rect.width)
+    const startY = Math.min(Math.max(e.clientY - rect.top, 0), rect.height)
+    regionDrag.current = { startX, startY, rect }
+    e.currentTarget.setPointerCapture(e.pointerId)
+    setRegionSel({ x: startX, y: startY, w: 0, h: 0 })
+  }, [])
+
+  const moveRegionDrag = useCallback((e: ReactPointerEvent<HTMLImageElement>) => {
+    const drag = regionDrag.current
+    if (!drag) return
+    const cx = Math.min(Math.max(e.clientX - drag.rect.left, 0), drag.rect.width)
+    const cy = Math.min(Math.max(e.clientY - drag.rect.top, 0), drag.rect.height)
+    setRegionSel({
+      x: Math.min(drag.startX, cx),
+      y: Math.min(drag.startY, cy),
+      w: Math.abs(cx - drag.startX),
+      h: Math.abs(cy - drag.startY)
+    })
+  }, [])
+
+  const endRegionDrag = useCallback((e: ReactPointerEvent<HTMLImageElement>) => {
+    regionDrag.current = null
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId)
+    } catch {
+      /* already released */
+    }
+  }, [])
+
+  const saveRegion = useCallback(async () => {
+    const image = regionImgRef.current
+    if (!regionShot || !regionSel || !image || regionSel.w < 2 || regionSel.h < 2) {
+      showToast('Drag a rectangle on the preview first')
+      return
+    }
+    setRegionSaving(true)
+    try {
+      // Preview CSS px -> captured-image px. Aspect ratio is preserved, so the
+      // naturalWidth / renderedWidth scale applies identically on both axes.
+      const scale = image.naturalWidth / image.getBoundingClientRect().width
+      const region = {
+        x: Math.round(regionSel.x * scale),
+        y: Math.round(regionSel.y * scale),
+        w: Math.round(regionSel.w * scale),
+        h: Math.round(regionSel.h * scale),
+        displayId: regionShot.displayId,
+        frameW: image.naturalWidth,
+        frameH: image.naturalHeight
+      }
+      const next = await window.api.setConfig({ capture: { region } })
+      setConfig(next)
+      closeRegionPicker()
+      showToast(`Capture region saved (${region.w}×${region.h}px)`)
+    } catch (err) {
+      setError(errorMessage(err))
+    } finally {
+      setRegionSaving(false)
+    }
+  }, [closeRegionPicker, regionSel, regionShot, showToast])
+
+  const clearRegion = useCallback(async () => {
+    try {
+      const next = await window.api.setConfig({ capture: { region: null } })
+      setConfig(next)
+      closeRegionPicker()
+      showToast('Capture region cleared')
+    } catch (err) {
+      setError(errorMessage(err))
+    }
+  }, [closeRegionPicker, showToast])
 
   const startCapture = useCallback(async () => {
     setError(null)
@@ -630,6 +926,8 @@ export default function App() {
       engines.current?.you?.stop()
       engines.current?.them?.stop()
       engines.current = { you, them }
+      askedUids.current = new Set()
+      pendingAsks.current = []
       chains.current = { You: Promise.resolve(), Them: Promise.resolve() }
       setListening(true)
       setView('live')
@@ -668,6 +966,12 @@ export default function App() {
     engines.current?.you?.stop()
     engines.current?.them?.stop()
     engines.current = null
+    askedUids.current = new Set()
+    pendingAsks.current = []
+    if (queueTimer.current) {
+      window.clearTimeout(queueTimer.current)
+      queueTimer.current = null
+    }
     setListening(false)
     setLevels({ you: 0, them: 0 })
   }, [])
@@ -702,7 +1006,8 @@ export default function App() {
     }
     partialSeq.current = { You: 0, Them: 0 }
     partialBusy.current = { You: false, Them: false }
-    lastEarlyUid.current = { You: -1, Them: -1 }
+    askedUids.current = new Set()
+    pendingAsks.current = []
     promptRef.current = { You: '', Them: '' }
   }, [])
 
@@ -723,6 +1028,18 @@ export default function App() {
       }
     },
     [pendingDelete, showToast]
+  )
+
+  const exportSession = useCallback(
+    async (name: string) => {
+      try {
+        const path = await window.api.exportSession(name)
+        showToast(`Exported: ${path}`)
+      } catch (err) {
+        setError(errorMessage(err))
+      }
+    },
+    [showToast]
   )
 
   const deleteAllSessions = useCallback(async () => {
@@ -852,6 +1169,61 @@ export default function App() {
             <button className="btn tiny" onClick={() => void window.api.installUpdate()}>
               Restart & install
             </button>
+          </div>
+        )}
+
+        {regionShot && (
+          // Rendered inside the capture-protected overlay on purpose: the preview
+          // and the drag selection must never be visible in screen shares.
+          <div className="region-modal" role="dialog" aria-label="Set capture region">
+            <div className="region-modal-head">
+              <strong>Set capture region</strong>
+              <button className="icon-btn" title="Cancel (Esc)" onClick={closeRegionPicker}>
+                ×
+              </button>
+            </div>
+            <p className="hint small">
+              Drag a rectangle around the area to capture. Saving binds it to this display; the
+              region is used by Ctrl+Alt+R.
+            </p>
+            <div className="region-preview">
+              <img
+                ref={regionImgRef}
+                src={regionShot.dataUrl}
+                alt="Screen capture preview"
+                draggable={false}
+                onPointerDown={startRegionDrag}
+                onPointerMove={moveRegionDrag}
+                onPointerUp={endRegionDrag}
+                onPointerCancel={endRegionDrag}
+              />
+              {regionSel && regionSel.w > 0 && regionSel.h > 0 && (
+                <div
+                  className="region-selection"
+                  style={{
+                    left: `${regionSel.x}px`,
+                    top: `${regionSel.y}px`,
+                    width: `${regionSel.w}px`,
+                    height: `${regionSel.h}px`
+                  }}
+                />
+              )}
+            </div>
+            <div className="row gap">
+              <button
+                className="btn primary"
+                disabled={regionSaving}
+                onClick={() => void saveRegion()}
+              >
+                Save region
+              </button>
+              <button className="btn" disabled={regionSaving} onClick={() => void clearRegion()}>
+                Clear region
+              </button>
+              <button className="btn ghost" onClick={closeRegionPicker}>
+                Cancel
+              </button>
+            </div>
           </div>
         )}
 
@@ -985,7 +1357,14 @@ export default function App() {
               </div>
             </div>
 
-            <div className="scroll" ref={scrollRef}>
+            <div
+              className="scroll"
+              ref={scrollRef}
+              onScroll={(e) => {
+                const el = e.currentTarget
+                atBottomRef.current = el.scrollTop + el.clientHeight >= el.scrollHeight - 48
+              }}
+            >
               {segments.length === 0 && answers.length === 0 && (
                 <div className="empty">
                   {listening
@@ -1071,6 +1450,13 @@ export default function App() {
               <div className="composer-actions">
                 <button className="btn" onClick={() => void captureShot()} title="Ctrl+Alt+Enter">
                   Screenshot
+                </button>
+                <button
+                  className="btn"
+                  onClick={() => void openRegionPicker()}
+                  title="Capture a saved region (Ctrl+Alt+R after saving)"
+                >
+                  Set region…
                 </button>
                 <button
                   className="btn"
@@ -1252,6 +1638,13 @@ export default function App() {
                         </div>
                       </button>
                       <button
+                        className="btn tiny"
+                        title="Export this session as Markdown"
+                        onClick={() => void exportSession(session.name)}
+                      >
+                        Export
+                      </button>
+                      <button
                         className="btn tiny danger"
                         title="Delete this session"
                         onClick={() => void deleteSession(session.name)}
@@ -1284,8 +1677,18 @@ function Settings({
   onClear: () => void
 }) {
   const [draft, setDraft] = useState<AppConfig>(config)
+  const [captureTest, setCaptureTest] = useState<CaptureTestReport | null>(null)
+  const [captureTesting, setCaptureTesting] = useState(false)
+  const [hotkeys, setHotkeys] = useState<HotkeyInfo[]>([])
 
   useEffect(() => setDraft(config), [config])
+
+  useEffect(() => {
+    void window.api
+      .getHotkeys()
+      .then(setHotkeys)
+      .catch(() => undefined)
+  }, [])
 
   const set = <K extends keyof AppConfig>(key: K, value: AppConfig[K]): void => {
     setDraft((prev) => ({ ...prev, [key]: value }))
@@ -1312,9 +1715,64 @@ function Settings({
     setDraft((prev) => ({ ...prev, meetings: { ...prev.meetings, [key]: value } }))
   }
 
+  const runCaptureTest = async (): Promise<void> => {
+    setCaptureTesting(true)
+    try {
+      const rendererChecks = await runRendererCaptureChecks()
+      let mainChecks: CaptureTestCheck[] = []
+      let ranAt = Date.now()
+      try {
+        const report = await window.api.testCapture()
+        mainChecks = report.checks
+        ranAt = report.ranAt
+      } catch (err) {
+        mainChecks = [
+          {
+            id: 'main-test',
+            label: 'Main-process checks',
+            pass: false,
+            detail: errorMessage(err)
+          }
+        ]
+      }
+      setCaptureTest({ checks: [...mainChecks, ...rendererChecks], ranAt })
+    } catch (err) {
+      setCaptureTest({
+        checks: [
+          {
+            id: 'capture-test',
+            label: 'Capture self-test',
+            pass: false,
+            detail: errorMessage(err)
+          }
+        ],
+        ranAt: Date.now()
+      })
+    } finally {
+      setCaptureTesting(false)
+    }
+  }
+
   return (
     <div className="settings">
       <div className="settings-scroll">
+        <h3>Interview presets</h3>
+        <div className="row gap">
+          <button
+            className="btn"
+            onClick={() => setDraft((prev) => applyPreset(prev, 'behavioral'))}
+          >
+            Behavioral
+          </button>
+          <button
+            className="btn"
+            onClick={() => setDraft((prev) => applyPreset(prev, 'coding'))}
+          >
+            Coding
+          </button>
+        </div>
+        <p className="hint small">Presets change effort and answer style only — the model is not changed.</p>
+
         <h3>Answer engine (OpenAI-compatible)</h3>
         <label className="field">
           <span>Base URL</span>
@@ -1338,33 +1796,70 @@ function Settings({
           <input
             value={draft.llm.model}
             onChange={(e) => setLlm('model', e.target.value)}
-            placeholder="qwen2.5:7b-instruct"
+            placeholder="qwen2.5vl:7b"
           />
         </label>
         <div className="grid2">
           <label className="field">
-            <span>Temperature</span>
+            <span>Temperature (0–1)</span>
             <input
               type="number"
-              step="0.1"
+              step="0.05"
               min="0"
-              max="2"
+              max="1"
               value={draft.llm.temperature}
               onChange={(e) => setLlm('temperature', Number(e.target.value))}
             />
           </label>
           <label className="field">
-            <span>Max tokens</span>
+            <span>Max tokens (128–8192)</span>
             <input
               type="number"
-              step="50"
-              min="50"
-              max="4000"
+              step="64"
+              min="128"
+              max="8192"
               value={draft.llm.maxTokens}
               onChange={(e) => setLlm('maxTokens', Number(e.target.value))}
             />
           </label>
         </div>
+        <label className="field">
+          <span>Reasoning effort</span>
+          <select
+            value={draft.llm.reasoningEffort}
+            onChange={(e) =>
+              setLlm('reasoningEffort', e.target.value as AppConfig['llm']['reasoningEffort'])
+            }
+          >
+            <option value="low">Low — fast (default)</option>
+            <option value="medium">Medium — balanced</option>
+            <option value="high">High — hard algorithmic (slower; use max tokens ≥ 4096)</option>
+          </select>
+        </label>
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={draft.llm.autoEscalate}
+            onChange={(e) => setLlm('autoEscalate', e.target.checked)}
+          />
+          <span>
+            Auto-escalate effort on coding questions (raises low → high; adds first-token latency)
+          </span>
+        </label>
+        <label className="field">
+          <span>Code language</span>
+          <select
+            value={draft.answer.codeLanguage}
+            onChange={(e) =>
+              setAnswer('codeLanguage', e.target.value as AppConfig['answer']['codeLanguage'])
+            }
+          >
+            <option value="python">Python</option>
+            <option value="javascript">JavaScript</option>
+            <option value="java">Java</option>
+            <option value="cpp">C++</option>
+          </select>
+        </label>
         <label className="check">
           <input
             type="checkbox"
@@ -1373,7 +1868,7 @@ function Settings({
           />
           <span>Model supports images (needed for screenshots in answers)</span>
         </label>
-        <p className="hint small">Vision models only, e.g. llava, qwen2.5-vl, gpt-4o.</p>
+        <p className="hint small">Vision models only, e.g. qwen2.5vl, llava, gpt-4o.</p>
 
         <h3>Answer style</h3>
         <div className="grid2">
@@ -1522,6 +2017,27 @@ function Settings({
           <span className="hint small">Hotkey: Ctrl+Shift+M</span>
         </div>
 
+        <h3>Hotkeys</h3>
+        <div className="hotkey-list">
+          {hotkeys.map((hotkey) => (
+            <div className="hotkey-row" key={hotkey.accelerator}>
+              <span className="hotkey-keys">
+                {formatAccelerator(hotkey.accelerator)
+                  .split('+')
+                  .map((part) => (
+                    <kbd key={part}>{part}</kbd>
+                  ))}
+              </span>
+              <span className="hotkey-desc">
+                {hotkey.description}
+                {!hotkey.registered && (
+                  <span className="hotkey-warn"> ⚠️ in use by another app</span>
+                )}
+              </span>
+            </div>
+          ))}
+        </div>
+
         <h3>Meetings</h3>
         <label className="check">
           <input
@@ -1610,6 +2126,33 @@ function Settings({
           </button>
         </div>
 
+        <h3>Capture self-test</h3>
+        <div className="row gap">
+          <button className="btn" disabled={captureTesting} onClick={() => void runCaptureTest()}>
+            {captureTesting ? 'Testing…' : 'Run capture self-test'}
+          </button>
+          <span className="hint small">Runs invisibly — no window, picker or prompt appears.</span>
+        </div>
+        {captureTest && (
+          <div className="test-results">
+            {captureTest.checks.map((check) => (
+              <div className="test-check" key={check.id}>
+                <span
+                  className={`test-mark ${
+                    check.pass === true ? 'pass' : check.pass === false ? 'fail' : 'skip'
+                  }`}
+                >
+                  {check.pass === true ? '✓' : check.pass === false ? '✗' : '–'}
+                </span>
+                <span className="test-check-body">
+                  <span className="test-check-label">{check.label}</span>
+                  <span className="test-check-detail">{check.detail}</span>
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+
         <h3>Behavior</h3>
         <label className="check">
           <input
@@ -1637,6 +2180,14 @@ function Settings({
             Transcribe microphone ("You") — off by default; the interviewer is captured from the
             system-audio loopback
           </span>
+        </label>
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={draft.interaction.autoScroll}
+            onChange={(e) => setInteraction('autoScroll', e.target.checked)}
+          />
+          <span>Auto-scroll answers (follow new content; pauses while you scroll up)</span>
         </label>
         <label className="check">
           <input

@@ -57,5 +57,5 @@ if ($server) {
 Write-Host ""
 Write-Host "Answers (Ollama):"
 Write-Host "  winget install Ollama.Ollama"
-Write-Host "  ollama pull qwen2.5:7b-instruct"
+Write-Host "  ollama pull qwen2.5vl:7b"
 Write-Host "Then run the app: npm run dev"

@@ -3,7 +3,7 @@
 param(
   [string]$OllamaUrl = "http://127.0.0.1:11434/v1",
   [string]$WhisperUrl = "http://127.0.0.1:8080/inference",
-  [string]$Model = "qwen2.5:7b-instruct"
+  [string]$Model = "qwen2.5vl:7b"
 )
 
 $ErrorActionPreference = "Continue"

@@ -6,6 +6,12 @@ files:
   - out/**/*
   - package.json
 afterPack: scripts/after-pack.js
+# Artifacts attach to GitHub Releases only when dist is run with GH_TOKEN and
+# --publish; the generic-feed autoUpdater flow is unchanged.
+publish:
+  provider: github
+  owner: Folayan-Kayode
+  repo: parakeet-clone
 win:
   target:
     - nsis

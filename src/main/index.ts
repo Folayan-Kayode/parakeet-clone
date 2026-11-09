@@ -9,14 +9,23 @@ import {
   Tray,
   Menu,
   nativeImage,
-  type Display
+  type Display,
+  type NativeImage
 } from 'electron'
 import { join, basename } from 'node:path'
-import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs'
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  unlinkSync,
+  writeFileSync,
+  promises as fsPromises
+} from 'node:fs'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { autoUpdater } from 'electron-updater'
-import type { AppConfig, ChatRequest } from '../shared/types'
+import type { AppConfig, CaptureTestCheck, CaptureTestReport, ChatRequest } from '../shared/types'
 
 const execFileAsync = promisify(execFile)
 
@@ -30,9 +39,14 @@ const DEFAULT_CONFIG: AppConfig = {
   llm: {
     baseUrl: 'http://127.0.0.1:11434/v1',
     apiKey: '',
-    model: 'qwen2.5:7b-instruct',
-    temperature: 0.4,
-    maxTokens: 400,
+    // vision-capable: reads screenshots (pull: ollama pull qwen2.5vl:7b)
+    model: 'qwen2.5vl:7b',
+    temperature: 0.2,
+    // thinking tokens count against max_tokens on Gemini; 1024 truncates at high effort
+    maxTokens: 4096,
+    // low keeps time-to-first-token fast for live interviews; high for hard algorithmic questions
+    reasoningEffort: 'low',
+    autoEscalate: false,
     vision: false
   },
   asr: {
@@ -46,14 +60,16 @@ const DEFAULT_CONFIG: AppConfig = {
     answerCooldownMs: 5000,
     transcribeMic: false,
     streamingPartials: true,
-    earlyAnswer: true
+    earlyAnswer: true,
+    autoScroll: true
   },
   answer: {
     length: 'balanced',
     format: 'balanced',
     tone: 'formal',
     star: false,
-    fillerWords: false
+    fillerWords: false,
+    codeLanguage: 'python'
   },
   profile: {
     resume: '',
@@ -68,7 +84,9 @@ const DEFAULT_CONFIG: AppConfig = {
   window: {
     screenMode: 'primary',
     x: null,
-    y: null
+    y: null,
+    width: null,
+    height: null
   },
   updates: {
     enabled: false,
@@ -77,6 +95,9 @@ const DEFAULT_CONFIG: AppConfig = {
   meetings: {
     detect: false,
     autoStart: false
+  },
+  capture: {
+    region: null
   }
 }
 
@@ -90,6 +111,75 @@ let updateTimer: ReturnType<typeof setInterval> | null = null
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v)
+}
+
+// Keep error text out of check details/logs: execFile failures can include the
+// (large, base64) command line.
+function errorText(err: unknown, max = 160): string {
+  const text = err instanceof Error ? err.message : String(err)
+  return text.length > max ? text.slice(-max) : text
+}
+
+function clampTemperature(value: number): number {
+  return Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : 0.2
+}
+
+function clampMaxTokens(value: number): number {
+  return Number.isFinite(value) ? Math.min(8192, Math.max(128, Math.round(value))) : 4096
+}
+
+// Never send 'minimal' (errors on current Flash models) or 'none' (unsupported on Gemini 3.x/4.x).
+function clampReasoningEffort(
+  value: AppConfig['llm']['reasoningEffort']
+): 'low' | 'medium' | 'high' {
+  return value === 'medium' || value === 'high' ? value : 'low'
+}
+
+// Deliberately narrow: false negatives are fine, false positives cost latency.
+const CODE_RE =
+  /\b(algorithm|complexity|time complexity|optimi[sz]e|dynamic programming|data structure|binary search|recursion|two pointers|sliding window)\b/i
+
+// Prevents a stalled stream from latching streaming.current until app restart.
+const STREAM_IDLE_TIMEOUT_MS = 20_000
+
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new DOMException('Aborted', 'AbortError'))
+      return
+    }
+    const onAbort = (): void => {
+      clearTimeout(timer)
+      reject(new DOMException('Aborted', 'AbortError'))
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+// Interview constraint: never retry mid-stream — a silent second generation
+// would duplicate or contradict tokens the user already saw. Retries are only
+// for 429/5xx before the first token (1s, then 3s), and abort cancels them.
+async function fetchChatWithRetry(
+  url: string,
+  init: RequestInit,
+  signal: AbortSignal
+): Promise<Response> {
+  const retryDelays = [1000, 3000]
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(url, init)
+    if (res.ok && res.body) return res
+    const detail = await res.text()
+    if ((res.status === 429 || res.status >= 500) && attempt < retryDelays.length) {
+      console.warn(`[llm] ${res.status} before first token — retrying in ${retryDelays[attempt]}ms`)
+      await sleep(retryDelays[attempt], signal)
+      continue
+    }
+    throw new Error(`LLM error ${res.status}: ${detail.slice(0, 400)}`)
+  }
 }
 
 function deepMerge<T>(base: T, patch: unknown): T {
@@ -147,6 +237,74 @@ function displayForWindow(): Display {
   return screen.getPrimaryDisplay()
 }
 
+// Shared by the screenshot button/hotkey and the region picker so the preview
+// and the cropped pixels come from the same capped frame.
+async function captureDisplayFrame(): Promise<{ image: NativeImage; display: Display }> {
+  const display = displayForWindow()
+  const sources = await desktopCapturer.getSources({
+    types: ['screen'],
+    // 1600x900 caps capture latency and the vision context-token budget.
+    thumbnailSize: {
+      width: Math.min(display.size.width, 1600),
+      height: Math.min(display.size.height, 900)
+    }
+  })
+  const source =
+    sources.find((s) => s.display_id === String(display.id)) ?? sources[0] ?? null
+  if (!source) throw new Error('No screen source available')
+  if (source.thumbnail.isEmpty()) {
+    throw new Error('Screenshot is empty (screen may be locked or DRM protected)')
+  }
+  return { image: source.thumbnail, display }
+}
+
+function jpegDataUrl(image: NativeImage): string {
+  return `data:image/jpeg;base64,${image.toJPEG(85).toString('base64')}`
+}
+
+// Region screenshots are bound to the display they were selected on; moving the
+// overlay to another monitor (or clearing the region) falls back to full screen.
+async function captureRegionShot(): Promise<void> {
+  if (!win || win.isDestroyed()) return
+  try {
+    const { image, display } = await captureDisplayFrame()
+    const region = config.capture.region
+    let cropped = image
+    let hint: string | undefined
+    if (!region) {
+      hint = 'no region set — using full screen'
+    } else if (region.displayId !== display.id) {
+      hint = 'saved region is on another display — using full screen'
+    } else {
+      const bounds = image.getSize()
+      // DPI/resolution changes make the saved rect meaningless; fail safe.
+      if (
+        !Number.isFinite(region.frameW) ||
+        !Number.isFinite(region.frameH) ||
+        Math.abs(region.frameW - bounds.width) > 2 ||
+        Math.abs(region.frameH - bounds.height) > 2
+      ) {
+        hint = 'display changed — re-set the region'
+      } else {
+        const x = Math.max(0, Math.min(region.x, bounds.width - 1))
+        const y = Math.max(0, Math.min(region.y, bounds.height - 1))
+        const w = Math.max(1, Math.min(region.w, bounds.width - x))
+        const h = Math.max(1, Math.min(region.h, bounds.height - y))
+        cropped = image.crop({ x, y, width: w, height: h })
+      }
+    }
+    if (!win || win.isDestroyed()) return
+    win.webContents.send('shot:image', { dataUrl: jpegDataUrl(cropped), hint })
+  } catch (err) {
+    console.error('Region capture failed', err)
+    if (win && !win.isDestroyed()) {
+      win.webContents.send('shot:image', {
+        error: err instanceof Error ? err.message : String(err)
+      })
+    }
+  }
+}
+
 function topCenterOn(display: Display): void {
   if (!win || win.isDestroyed()) return
   const { x, y, width } = display.workArea
@@ -169,7 +327,9 @@ function intersectsAnyDisplay(x: number, y: number, w: number, h: number): boole
 
 function restoreWindowPosition(): void {
   if (!win || win.isDestroyed()) return
-  const [w, h] = win.getSize()
+  const [currentW, currentH] = win.getSize()
+  const w = Math.max(360, config.window.width ?? currentW)
+  const h = Math.max(280, config.window.height ?? currentH)
   if (
     config.window.x !== null &&
     config.window.y !== null &&
@@ -178,6 +338,7 @@ function restoreWindowPosition(): void {
     win.setBounds({ x: config.window.x, y: config.window.y, width: w, height: h })
     return
   }
+  if (config.window.width !== null || config.window.height !== null) win.setSize(w, h)
   if (config.window.screenMode === 'cursor') {
     topCenterOn(screen.getDisplayNearestPoint(screen.getCursorScreenPoint()))
   } else {
@@ -188,7 +349,10 @@ function restoreWindowPosition(): void {
 function saveWindowPosition(): void {
   if (!win || win.isDestroyed() || win.isMinimized() || win.isMaximized()) return
   const b = win.getBounds()
-  config = { ...config, window: { ...config.window, x: b.x, y: b.y } }
+  config = {
+    ...config,
+    window: { ...config.window, x: b.x, y: b.y, width: b.width, height: b.height }
+  }
   persistConfig()
 }
 
@@ -205,10 +369,73 @@ function toggleClickThrough(): void {
   if (win && !win.isDestroyed()) win.webContents.send('config:changed', config)
 }
 
+// Marker written after a successful one-shot verification, so later launches
+// skip the PowerShell spawn entirely.
+const TOOLWINDOW_MARKER = 'toolwindow-verified'
+
+function toolWindowMarkerPath(): string {
+  return join(app.getPath('userData'), TOOLWINDOW_MARKER)
+}
+
+// `type: 'toolbar'` is expected to map to WS_EX_TOOLWINDOW on Windows, which
+// hides the overlay from Alt-Tab and window enumeration. The mapping is not
+// visible in the shipped Electron typings, so verify it once and enforce it if
+// missing. Deliberately no WS_EX_NOACTIVATE: it would break clicking and typing
+// into the overlay.
+async function ensureToolWindowStyle(): Promise<void> {
+  if (!win || win.isDestroyed()) return
+  if (existsSync(toolWindowMarkerPath())) {
+    console.log('[window] tool window style: previously verified')
+    return
+  }
+  const hwnd = win.getNativeWindowHandle().readBigUInt64LE(0).toString()
+  // The C# source is base64-encoded so the script contains no embedded quotes.
+  const csharp =
+    'using System;using System.Runtime.InteropServices;' +
+    'public static class WinToolStyle{' +
+    '[DllImport("user32.dll")]' +
+    'public static extern IntPtr GetWindowLongPtrW(IntPtr hWnd,int nIndex);' +
+    '[DllImport("user32.dll")]' +
+    'public static extern IntPtr SetWindowLongPtrW(IntPtr hWnd,int nIndex,IntPtr dwNewLong);' +
+    '[DllImport("user32.dll")]' +
+    'public static extern bool SetWindowPos(IntPtr hWnd,IntPtr hWndInsertAfter,int X,int Y,int cx,int cy,uint uFlags);}'
+  const encoded = Buffer.from(csharp, 'utf8').toString('base64')
+  const script = [
+    `$code=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encoded}'));`,
+    'Add-Type -TypeDefinition $code;',
+    `$h=[IntPtr][Int64]${hwnd};`,
+    '$GWL_EXSTYLE=-20;',
+    '$WS_EX_TOOLWINDOW=0x80;',
+    '$style=([WinToolStyle]::GetWindowLongPtrW($h,$GWL_EXSTYLE)).ToInt64();',
+    "if(($style -band $WS_EX_TOOLWINDOW) -ne 0){Write-Output 'already set'}",
+    "else{[void][WinToolStyle]::SetWindowLongPtrW($h,$GWL_EXSTYLE,[IntPtr]($style -bor $WS_EX_TOOLWINDOW));" +
+      "[void][WinToolStyle]::SetWindowPos($h,[IntPtr]::Zero,0,0,0,0,0x37);Write-Output 'applied'}"
+  ].join(' ')
+  const { stdout } = await execFileAsync(
+    'powershell.exe',
+    [
+      '-NoProfile',
+      '-NonInteractive',
+      '-EncodedCommand',
+      Buffer.from(script, 'utf16le').toString('base64')
+    ],
+    { windowsHide: true, timeout: 5000, maxBuffer: 1024 * 1024 }
+  )
+  const text = String(stdout).trim()
+  console.log(`[window] tool window style: ${text || '(no output)'}`)
+  if (text === 'already set' || text === 'applied') {
+    await fsPromises
+      .writeFile(toolWindowMarkerPath(), '', 'utf8')
+      .catch((err) => console.error('[window] could not write tool window marker', err))
+  }
+}
+
 function createWindow(): void {
   win = new BrowserWindow({
     width: 520,
     height: 640,
+    minWidth: 360,
+    minHeight: 280,
     show: false,
     frame: false,
     transparent: true,
@@ -221,6 +448,9 @@ function createWindow(): void {
     roundedCorners: false,
     alwaysOnTop: true,
     backgroundColor: '#00000000',
+    // Tool window style: hidden from Alt-Tab and window pickers (see helper).
+    type: 'toolbar',
+    title: '',
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       contextIsolation: true,
@@ -229,17 +459,29 @@ function createWindow(): void {
     }
   })
 
+  // One-shot verification/enforcement (never blocks startup, log-only failures).
+  ensureToolWindowStyle().catch((err) =>
+    console.error('[window] tool window style check failed', errorText(err))
+  )
+
   applyStealth()
   restoreWindowPosition()
 
   let moveTimer: ReturnType<typeof setTimeout> | null = null
-  win.on('moved', () => {
+  const scheduleSave = (): void => {
     if (moveTimer) clearTimeout(moveTimer)
     moveTimer = setTimeout(() => saveWindowPosition(), 400)
-  })
+  }
+  win.on('moved', scheduleSave)
+  win.on('resized', scheduleSave)
+
+  // Keep the OS window title blank even if the renderer ever sets document.title.
+  win.on('page-title-updated', (e) => e.preventDefault())
 
   win.once('ready-to-show', () => {
-    win?.showInactive()
+    if (!win || win.isDestroyed()) return
+    if (win.getTitle() !== '') win.setTitle('')
+    win.showInactive()
   })
 
   win.webContents.on('console-message', (event) => {
@@ -284,6 +526,47 @@ function createWindow(): void {
   }, 1000)
 }
 
+// Global shortcuts are defined once, used for registration and surfaced to
+// Settings/README. Registration success is tracked at runtime (a combo may be
+// owned by another app); handlers are bound in registerHotkeys().
+interface HotkeySpec {
+  id: string
+  accelerator: string
+  description: string
+}
+
+const HOTKEYS: HotkeySpec[] = [
+  { id: 'move-up', accelerator: 'CommandOrControl+Shift+Up', description: 'Move overlay up' },
+  { id: 'move-down', accelerator: 'CommandOrControl+Shift+Down', description: 'Move overlay down' },
+  { id: 'move-left', accelerator: 'CommandOrControl+Shift+Left', description: 'Move overlay left' },
+  {
+    id: 'move-right',
+    accelerator: 'CommandOrControl+Shift+Right',
+    description: 'Move overlay right'
+  },
+  { id: 'answer', accelerator: 'CommandOrControl+Shift+Enter', description: 'Answer' },
+  { id: 'screenshot', accelerator: 'CommandOrControl+Alt+Enter', description: 'Screenshot' },
+  {
+    id: 'screenshot-region',
+    accelerator: 'CommandOrControl+Alt+R',
+    description: 'Region screenshot'
+  },
+  { id: 'chat', accelerator: 'CommandOrControl+Shift+Space', description: 'Focus chat' },
+  { id: 'hide', accelerator: 'CommandOrControl+H', description: 'Hide' },
+  {
+    id: 'toggle-click-through',
+    accelerator: 'CommandOrControl+Shift+F9',
+    description: 'Toggle click-through'
+  },
+  {
+    id: 'move-to-cursor',
+    accelerator: 'CommandOrControl+Shift+M',
+    description: "Move overlay to the cursor's monitor"
+  }
+]
+
+const hotkeyStatus = new Map<string, boolean>()
+
 function registerHotkeys(): void {
   const nudge = (dx: number, dy: number): void => {
     if (!win || win.isDestroyed()) return
@@ -291,25 +574,120 @@ function registerHotkeys(): void {
     win.setPosition(b.x + dx, b.y + dy)
   }
 
-  globalShortcut.register('CommandOrControl+Shift+Up', () => nudge(0, -40))
-  globalShortcut.register('CommandOrControl+Shift+Down', () => nudge(0, 40))
-  globalShortcut.register('CommandOrControl+Shift+Left', () => nudge(-40, 0))
-  globalShortcut.register('CommandOrControl+Shift+Right', () => nudge(40, 0))
+  const actions: Record<string, () => void> = {
+    'move-up': () => nudge(0, -40),
+    'move-down': () => nudge(0, 40),
+    'move-left': () => nudge(-40, 0),
+    'move-right': () => nudge(40, 0),
+    answer: () => sendHotkey('answer'),
+    screenshot: () => sendHotkey('screenshot'),
+    'screenshot-region': () => void captureRegionShot(),
+    chat: () => {
+      if (win && !win.isDestroyed()) {
+        win.showInactive()
+        win.focus()
+      }
+      sendHotkey('chat')
+    },
+    hide: () => {
+      if (win && !win.isDestroyed()) win.hide()
+    },
+    'toggle-click-through': () => toggleClickThrough(),
+    'move-to-cursor': () => moveToCursorDisplay()
+  }
 
-  globalShortcut.register('CommandOrControl+Shift+Enter', () => sendHotkey('answer'))
-  globalShortcut.register('CommandOrControl+Alt+Enter', () => sendHotkey('screenshot'))
-  globalShortcut.register('CommandOrControl+Shift+Space', () => {
-    if (win && !win.isDestroyed()) {
-      win.showInactive()
-      win.focus()
+  for (const hotkey of HOTKEYS) {
+    const registered = globalShortcut.register(
+      hotkey.accelerator,
+      actions[hotkey.id] ?? (() => undefined)
+    )
+    hotkeyStatus.set(hotkey.id, registered)
+    if (!registered) {
+      console.warn(
+        `[hotkeys] ${hotkey.accelerator} not registered — likely owned by another app`
+      )
     }
-    sendHotkey('chat')
-  })
-  globalShortcut.register('CommandOrControl+H', () => {
-    if (win && !win.isDestroyed()) win.hide()
-  })
-  globalShortcut.register('CommandOrControl+Shift+F9', () => toggleClickThrough())
-  globalShortcut.register('CommandOrControl+Shift+M', () => moveToCursorDisplay())
+  }
+}
+
+async function checkCaptureExclusion(): Promise<CaptureTestCheck> {
+  const label = 'OS capture exclusion'
+  if (!win || win.isDestroyed()) {
+    return {
+      id: 'os-capture-exclusion',
+      label,
+      pass: null,
+      detail: 'overlay window is not available'
+    }
+  }
+  try {
+    const hwnd = win.getNativeWindowHandle().readBigUInt64LE(0).toString()
+    // The C# source is base64-encoded so the -Command string contains no double quotes.
+    const csharp =
+      'using System;using System.Runtime.InteropServices;' +
+      'public static class WinAffinity{' +
+      '[DllImport("user32.dll")]' +
+      'public static extern bool GetWindowDisplayAffinity(IntPtr hWnd,out uint pdwAffinity);}'
+    const encoded = Buffer.from(csharp, 'utf8').toString('base64')
+    const command = [
+      `$code=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encoded}'));`,
+      'Add-Type -TypeDefinition $code;',
+      '$flags=0;',
+      `if(-not [WinAffinity]::GetWindowDisplayAffinity([IntPtr][Int64]${hwnd},[ref]$flags)){throw 'GetWindowDisplayAffinity failed'};`,
+      'Write-Output $flags'
+    ].join(' ')
+    const { stdout } = await execFileAsync(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-EncodedCommand',
+        Buffer.from(command, 'utf16le').toString('base64')
+      ],
+      { windowsHide: true, timeout: 5000, maxBuffer: 1024 * 1024 }
+    )
+    const text = String(stdout).trim()
+    const match = /(\d+)\s*$/.exec(text)
+    if (!match) {
+      return {
+        id: 'os-capture-exclusion',
+        label,
+        pass: null,
+        detail: `could not parse PowerShell output: ${text.slice(0, 200) || '(empty)'}`
+      }
+    }
+    const flags = Number(match[1])
+    if (flags === 0x11) {
+      return {
+        id: 'os-capture-exclusion',
+        label,
+        pass: true,
+        detail:
+          'WDA_EXCLUDEFROMCAPTURE set — overlay invisible to screen sharing, recording and screenshots'
+      }
+    }
+    if (flags === 0) {
+      return {
+        id: 'os-capture-exclusion',
+        label,
+        pass: false,
+        detail: 'overlay is capturable — enable Private mode (screen-capture protection) in Settings'
+      }
+    }
+    return {
+      id: 'os-capture-exclusion',
+      label,
+      pass: null,
+      detail: `unexpected display affinity flags 0x${flags.toString(16)}`
+    }
+  } catch (err) {
+    return {
+      id: 'os-capture-exclusion',
+      label,
+      pass: null,
+      detail: `check skipped: ${errorText(err)}`
+    }
+  }
 }
 
 function registerIpc(): void {
@@ -373,6 +751,14 @@ function registerIpc(): void {
     configPath: configPath()
   }))
 
+  ipcMain.handle('hotkeys:list', () =>
+    HOTKEYS.map((hotkey) => ({
+      accelerator: hotkey.accelerator,
+      description: hotkey.description,
+      registered: hotkeyStatus.get(hotkey.id) ?? false
+    }))
+  )
+
   ipcMain.handle('session:save', (_e, payload: unknown) => {
     try {
       const dir = join(app.getPath('userData'), 'sessions')
@@ -387,19 +773,14 @@ function registerIpc(): void {
   })
 
   ipcMain.handle('shot:capture', async () => {
-    const display = displayForWindow()
-    const sources = await desktopCapturer.getSources({
-      types: ['screen'],
-      thumbnailSize: {
-        width: Math.min(display.size.width, 3840),
-        height: Math.min(display.size.height, 2160)
-      }
-    })
-    const source =
-      sources.find((s) => s.display_id === String(display.id)) ?? sources[0] ?? null
-    if (!source) throw new Error('No screen source available')
-    if (source.thumbnail.isEmpty()) throw new Error('Screenshot is empty (screen may be locked or DRM protected)')
-    return `data:image/jpeg;base64,${source.thumbnail.toJPEG(85).toString('base64')}`
+    const { image } = await captureDisplayFrame()
+    return jpegDataUrl(image)
+  })
+
+  // Source frame + display id for the in-overlay region picker (not attached).
+  ipcMain.handle('shot:capture-source', async () => {
+    const { image, display } = await captureDisplayFrame()
+    return { dataUrl: jpegDataUrl(image), displayId: display.id }
   })
 
   ipcMain.handle('asr:transcribe', async (_e, req: { wav: ArrayBuffer; prompt?: string }) => {
@@ -427,7 +808,9 @@ function registerIpc(): void {
         body: JSON.stringify({
           model: config.llm.model,
           stream: false,
-          max_tokens: 16,
+          temperature: clampTemperature(config.llm.temperature),
+          max_tokens: clampMaxTokens(config.llm.maxTokens),
+          reasoning_effort: clampReasoningEffort(config.llm.reasoningEffort),
           messages: [{ role: 'user', content: 'Reply with exactly: OK' }]
         })
       })
@@ -440,6 +823,102 @@ function registerIpc(): void {
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) }
     }
+  })
+
+  ipcMain.handle('test:capture', async (): Promise<CaptureTestReport> => {
+    const checks: CaptureTestCheck[] = []
+
+    try {
+      const sources = await desktopCapturer.getSources({
+        types: ['screen'],
+        thumbnailSize: { width: 1280, height: 720 }
+      })
+      const source = sources.find((s) => !s.thumbnail.isEmpty())
+      if (source) {
+        checks.push({
+          id: 'screen-capture',
+          label: 'Screen capture',
+          pass: true,
+          detail: `${sources.length} screen source(s); thumbnail ${source.thumbnail.toJPEG(85).length} bytes JPEG`
+        })
+      } else {
+        checks.push({
+          id: 'screen-capture',
+          label: 'Screen capture',
+          pass: false,
+          detail:
+            sources.length === 0
+              ? 'no screen sources were returned'
+              : 'screen sources returned but every thumbnail was empty'
+        })
+      }
+    } catch (err) {
+      checks.push({
+        id: 'screen-capture',
+        label: 'Screen capture',
+        pass: false,
+        detail: err instanceof Error ? err.message : String(err)
+      })
+    }
+
+    checks.push(await checkCaptureExclusion())
+
+    try {
+      if (!win || win.isDestroyed()) {
+        checks.push({
+          id: 'window-picker-hidden',
+          label: 'Hidden from window pickers',
+          pass: null,
+          detail: 'overlay window is not available'
+        })
+      } else {
+        const hwnd = win.getNativeWindowHandle().readBigUInt64LE(0)
+        const sources = await desktopCapturer.getSources({
+          types: ['window'],
+          thumbnailSize: { width: 0, height: 0 }
+        })
+        // Source ids are `window:<HWND>:<other>` (or bare numbers on some
+        // platforms); only pure-digit handles are recognized. Unrecognized
+        // formats are rejected, making the check fail-closed (skipped).
+        const handleOf = (id: string): string | null => {
+          const [kind, handle] = id.split(':')
+          if (kind === 'window') return handle && /^\d+$/.test(handle) ? handle : null
+          return /^\d+$/.test(id) ? id : null
+        }
+        const recognized = sources
+          .map((source) => ({ source, handle: handleOf(source.id) }))
+          .filter((entry): entry is { source: (typeof sources)[number]; handle: string } =>
+            entry.handle !== null
+          )
+        if (recognized.length === 0) {
+          checks.push({
+            id: 'window-picker-hidden',
+            label: 'Hidden from window pickers',
+            pass: null,
+            detail: 'unrecognized source id format — check skipped'
+          })
+        } else {
+          const overlay = recognized.find((entry) => BigInt(entry.handle) === hwnd)?.source
+          checks.push({
+            id: 'window-picker-hidden',
+            label: 'Hidden from window pickers',
+            pass: !overlay,
+            detail: overlay
+              ? `overlay window (HWND ${hwnd.toString()}) is offered as "${overlay.name}"`
+              : `overlay HWND not among ${sources.length} enumerated windows`
+          })
+        }
+      }
+    } catch (err) {
+      checks.push({
+        id: 'window-picker-hidden',
+        label: 'Hidden from window pickers',
+        pass: null,
+        detail: `check skipped: ${err instanceof Error ? err.message : String(err)}`
+      })
+    }
+
+    return { checks, ranAt: Date.now() }
   })
 
   ipcMain.handle('sessions:list', () => {
@@ -480,11 +959,72 @@ function registerIpc(): void {
     return JSON.parse(readFileSync(full, 'utf8'))
   })
 
+  ipcMain.handle('sessions:export', (_e, name: string) => {
+    if (!/^[\w.-]+\.json$/.test(name) || basename(name) !== name) {
+      throw new Error('Invalid session name')
+    }
+    const dir = join(app.getPath('userData'), 'sessions')
+    const data = JSON.parse(readFileSync(join(dir, name), 'utf8')) as {
+      title?: string
+      endedAt?: string
+      segments?: Array<{ id?: string; speaker?: string; text?: string }>
+      answers?: Array<{ text?: string; error?: string; question?: string; anchorId?: string }>
+    }
+    const answersByAnchor = new Map<string, string[]>()
+    const loose: string[] = []
+    for (const answer of data.answers ?? []) {
+      const body = (answer.text || answer.error || '').trim()
+      if (!body) continue
+      const quote = body
+        .split('\n')
+        .map((line) => `> ${line}`)
+        .join('\n')
+      if (answer.anchorId) {
+        const list = answersByAnchor.get(answer.anchorId) ?? []
+        list.push(quote)
+        answersByAnchor.set(answer.anchorId, list)
+      } else {
+        loose.push(quote)
+      }
+    }
+    const lines: string[] = [`# ${data.title?.trim() || 'Session'}`, '']
+    for (const segment of data.segments ?? []) {
+      const speaker = segment.speaker === 'You' ? 'You' : 'Them'
+      lines.push(`**${speaker}:** ${(segment.text ?? '').trim()}`, '')
+      if (segment.id) {
+        for (const quote of answersByAnchor.get(segment.id) ?? []) lines.push(quote, '')
+        answersByAnchor.delete(segment.id)
+      }
+    }
+    for (const list of answersByAnchor.values()) {
+      for (const quote of list) lines.push(quote, '')
+    }
+    for (const quote of loose) lines.push(quote, '')
+    lines.push(
+      '---',
+      `Exported from Parakeet Clone — ${data.endedAt ?? new Date().toISOString()}`,
+      ''
+    )
+    const outPath = join(dir, `${name.replace(/\.json$/i, '')}.md`)
+    writeFileSync(outPath, lines.join('\n'), 'utf8')
+    return outPath
+  })
+
   ipcMain.handle('sessions:delete', (_e, name: string) => {
     if (!/^[\w.-]+\.json$/.test(name) || basename(name) !== name) {
       throw new Error('Invalid session name')
     }
-    unlinkSync(join(app.getPath('userData'), 'sessions', name))
+    const dir = join(app.getPath('userData'), 'sessions')
+    unlinkSync(join(dir, name))
+    // Drop the sibling Markdown export too, if one was generated.
+    const exportPath = join(dir, `${name.replace(/\.json$/i, '')}.md`)
+    if (existsSync(exportPath)) {
+      try {
+        unlinkSync(exportPath)
+      } catch (err) {
+        console.error('Could not delete session export', err)
+      }
+    }
     return true
   })
 
@@ -493,10 +1033,12 @@ function registerIpc(): void {
     if (!existsSync(dir)) return 0
     let count = 0
     for (const file of readdirSync(dir)) {
-      if (!/^[\w.-]+\.json$/.test(file)) continue
+      const isSession = /^[\w.-]+\.json$/.test(file)
+      const isExport = /^[\w.-]+\.md$/.test(file)
+      if (!isSession && !isExport) continue
       try {
         unlinkSync(join(dir, file))
-        count += 1
+        if (isSession) count += 1
       } catch {
         /* skip locked files */
       }
@@ -541,32 +1083,60 @@ function registerIpc(): void {
       }
     }
 
+    const configuredEffort = clampReasoningEffort(config.llm.reasoningEffort)
+    // Auto-escalate only from 'low'; the regex is intentionally narrow.
+    const effectiveEffort =
+      config.llm.autoEscalate &&
+      configuredEffort === 'low' &&
+      (req.images.length > 0 || CODE_RE.test(last?.content ?? ''))
+        ? 'high'
+        : configuredEffort
+
     const body = {
       model: config.llm.model,
       stream: true,
-      temperature: config.llm.temperature,
-      max_tokens: config.llm.maxTokens,
+      temperature: clampTemperature(config.llm.temperature),
+      max_tokens: clampMaxTokens(config.llm.maxTokens),
+      reasoning_effort: effectiveEffort,
       messages
     }
 
-    try {
-      const res = await fetch(endpoint, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(body),
-        signal: ctrl.signal
-      })
-      if (!res.ok || !res.body) {
-        const detail = await res.text()
-        throw new Error(`LLM error ${res.status}: ${detail.slice(0, 400)}`)
+    let streamIdleTimer: ReturnType<typeof setTimeout> | null = null
+    let streamTimedOut = false
+    const clearStreamIdleTimer = (): void => {
+      if (streamIdleTimer) {
+        clearTimeout(streamIdleTimer)
+        streamIdleTimer = null
       }
+    }
 
-      const reader = res.body.getReader()
+    try {
+      // 429/5xx retries (1s, 3s) happen only before the stream starts; once
+      // tokens flow there is no retry, so the user never sees a silent restart.
+      const res = await fetchChatWithRetry(
+        endpoint,
+        { method: 'POST', headers, body: JSON.stringify(body), signal: ctrl.signal },
+        ctrl.signal
+      )
+
+      const stream = res.body
+      if (!stream) throw new Error('LLM error: response has no body')
+      const reader = stream.getReader()
       const decoder = new TextDecoder()
       let buffer = ''
       let full = ''
 
+      const resetStreamIdleTimer = (): void => {
+        clearStreamIdleTimer()
+        streamIdleTimer = setTimeout(() => {
+          streamTimedOut = true
+          ctrl.abort()
+        }, STREAM_IDLE_TIMEOUT_MS)
+      }
+      resetStreamIdleTimer()
+
       const emit = (text: string): void => {
+        resetStreamIdleTimer()
         full += text
         event.sender.send('llm:delta', { id: req.id, text })
       }
@@ -593,14 +1163,20 @@ function registerIpc(): void {
           }
         }
       }
+      clearStreamIdleTimer()
       event.sender.send('llm:done', { id: req.id })
       console.log(`[llm-answer] ${full}`)
       return { ok: true, text: full }
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err)
+      const message = streamTimedOut
+        ? 'no response from the model for 20s — check your endpoint'
+        : err instanceof Error
+          ? err.message
+          : String(err)
       event.sender.send('llm:error', { id: req.id, message })
       throw new Error(message)
     } finally {
+      clearStreamIdleTimer()
       aborters.delete(req.id)
     }
   })

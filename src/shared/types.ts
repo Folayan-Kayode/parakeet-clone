@@ -6,6 +6,8 @@ export interface LlmConfig {
   model: string
   temperature: number
   maxTokens: number
+  reasoningEffort: 'low' | 'medium' | 'high'
+  autoEscalate: boolean
   vision: boolean
 }
 
@@ -22,6 +24,7 @@ export interface InteractionConfig {
   transcribeMic: boolean
   streamingPartials: boolean
   earlyAnswer: boolean
+  autoScroll: boolean
 }
 
 export type AnswerLength = 'concise' | 'balanced' | 'detailed'
@@ -34,6 +37,7 @@ export interface AnswerStyle {
   tone: AnswerTone
   star: boolean
   fillerWords: boolean
+  codeLanguage: 'python' | 'javascript' | 'java' | 'cpp'
 }
 
 export interface ProfileContext {
@@ -52,6 +56,8 @@ export interface WindowConfig {
   screenMode: 'primary' | 'cursor'
   x: number | null
   y: number | null
+  width: number | null
+  height: number | null
 }
 
 export interface UpdatesConfig {
@@ -62,6 +68,23 @@ export interface UpdatesConfig {
 export interface MeetingsConfig {
   detect: boolean
   autoStart: boolean
+}
+
+export interface CaptureRegion {
+  /** Origin/size in captured-image pixels for the overlay's display. */
+  x: number
+  y: number
+  w: number
+  h: number
+  /** Region is bound to one display; a move to another falls back to full screen. */
+  displayId: number
+  /** Captured frame size when the region was set; a DPI/resolution change falls back. */
+  frameW: number
+  frameH: number
+}
+
+export interface CaptureConfig {
+  region: CaptureRegion | null
 }
 
 export interface AppConfig {
@@ -77,6 +100,7 @@ export interface AppConfig {
   window: WindowConfig
   updates: UpdatesConfig
   meetings: MeetingsConfig
+  capture: CaptureConfig
 }
 
 export interface ChatMessage {
@@ -103,4 +127,23 @@ export interface HotkeyName {
   answer: 'answer'
   screenshot: 'screenshot'
   chat: 'chat'
+}
+
+export interface CaptureTestCheck {
+  id: string
+  label: string
+  /** true = pass, false = fail, null = skipped/unknown */
+  pass: boolean | null
+  detail: string
+}
+
+export interface CaptureTestReport {
+  checks: CaptureTestCheck[]
+  ranAt: number
+}
+
+export interface HotkeyInfo {
+  accelerator: string
+  description: string
+  registered: boolean
 }
