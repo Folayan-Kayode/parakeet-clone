@@ -1,0 +1,16 @@
+appId: com.davel.parakeetclone
+productName: Parakeet Clone
+directories:
+  output: dist
+files:
+  - out/**/*
+  - package.json
+afterPack: scripts/after-pack.js
+win:
+  target:
+    - nsis
+    - zip
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
