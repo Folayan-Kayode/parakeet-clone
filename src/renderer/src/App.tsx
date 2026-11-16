@@ -1,24 +1,27 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ChangeEvent, PointerEvent as ReactPointerEvent } from 'react'
 import type {
-  AnswerStyle,
   AppConfig,
   CaptureTestCheck,
-  CaptureTestReport,
   ChatMessage,
-  EffortSetting,
-  HotkeyInfo,
-  ModelCatalogEntry,
-  ModelProfile,
   QuestionType,
   ResolvedQuestionType,
   SpeedBadge
 } from '../../shared/types'
-import { MODEL_CATALOG } from '../../shared/types'
 import {
   parseStructuredAnswerText as parseStructuredAnswer,
   type StructuredAnswer
 } from '../../shared/structuredAnswer'
+import { buildWhisperPrompt } from '../../shared/whisper-prompt'
+import { buildSystemPrompt } from '../../shared/prompt'
+import {
+  isQuestion,
+  looksCompleteQuestion,
+  resolveQuestionType,
+  similarity
+} from '../../shared/question-heuristics'
+import HistoryView, { type SessionData, type SessionSummary } from './HistoryView'
+import SettingsView from './SettingsView'
 import {
   AudioEngine,
   startMicStream,
@@ -61,11 +64,6 @@ interface Answer {
   card?: StructuredAnswer
   /** Screenshot data URLs sent with this ask (capped when saved). */
   images?: string[]
-}
-
-function clip(text: string, max: number): string {
-  const t = text.trim()
-  return t.length > max ? `${t.slice(0, max)}…` : t
 }
 
 // Wrap concatenated 16 kHz mono 16-bit PCM blocks in a fresh WAV header.
@@ -118,100 +116,6 @@ const QUESTION_TYPE_OPTIONS: ResolvedQuestionType[] = [
   'technical',
   'other'
 ]
-
-// Same intent as the main process CODE_RE, widened just enough for spoken questions.
-const CODING_GUESS_RE =
-  /\b(algorithm|complexity|optimi[sz]e|dynamic programming|data structure|binary search|recursion|two pointers|sliding window|implement|write (a|the) (function|method|program)|leetcode|array|linked list|hash ?map|stack|queue|binary tree|graph|big.?o)\b/i
-
-const BEHAVIORAL_GUESS_RE =
-  /\b(tell me about a time|describe a (situation|time|challenge)|give me an example|conflict|disagree|teamwork|worked (with|on a team)|challenge|failure|mistake|proud of|strength|weakness|leadership|deadline|under pressure|went wrong|difficult (person|situation))\b/i
-
-const BEHAVIORAL_OPENER_RE = /^\s*(tell me about (a time|yourself)|describe (a time|a situation))/i
-
-function guessQuestionType(text: string): ResolvedQuestionType {
-  // A story-style opener wins even when it mentions a coding verb ("...implement a change").
-  if (BEHAVIORAL_OPENER_RE.test(text)) return 'behavioral'
-  if (CODING_GUESS_RE.test(text)) return 'coding'
-  if (BEHAVIORAL_GUESS_RE.test(text)) return 'behavioral'
-  return 'other'
-}
-
-function resolveQuestionType(setting: QuestionType, text: string): ResolvedQuestionType {
-  return setting === 'auto' ? guessQuestionType(text) : setting
-}
-
-// Static preview corpus: shaped by the live style draft, never sent anywhere.
-// Rough word targets: concise ~45, balanced ~85, detailed ~140.
-function sampleBehavioral(a: AnswerStyle): string {
-  const story = [
-    'At my last company our checkout p95 doubled a week before launch',
-    'I owned the rollout and had to recover latency without moving the date',
-    'I profiled the hot path, split a blocking write, and paired with the on-call engineer on a bounded cache',
-    'As a result, p95 fell under 200 ms and we shipped on time with no rollbacks',
-    'The lesson was to measure first and keep the fix small'
-  ]
-  let beats: string[]
-  if (a.star) {
-    beats =
-      a.length === 'concise'
-        ? [story[0], story[2], story[3]]
-        : a.length === 'detailed'
-          ? story
-          : story.slice(0, 4)
-  } else {
-    beats =
-      a.length === 'concise'
-        ? [story[0], story[2]]
-        : a.length === 'detailed'
-          ? [...story.slice(0, 3), story[4]]
-          : story.slice(0, 3)
-  }
-  if (a.tone === 'simple') {
-    beats = beats.map((beat) => beat.replace('profiled the hot path', 'checked where the time went'))
-  }
-  const lines = beats.map((beat) => `${beat}.`)
-  if (a.tone === 'casual') {
-    lines[0] = `So, ${lines[0].charAt(0).toLowerCase()}${lines[0].slice(1)} you know?`
-  }
-  if (a.fillerWords && a.tone !== 'casual') {
-    lines.splice(1, 0, 'Honestly, that week was intense.')
-  }
-  if (a.format === 'bullets') return lines.map((line) => `• ${line}`).join('\n')
-  if (a.format === 'balanced') {
-    const split = Math.max(1, Math.ceil(lines.length / 2))
-    return `${lines.slice(0, split).join(' ')}\n\n${lines.slice(split).join(' ')}`
-  }
-  return lines.join(' ')
-}
-
-function sampleCoding(a: AnswerStyle): string {
-  const code: Record<AnswerStyle['codeLanguage'], string> = {
-    python:
-      'def two_sum(nums, target):\n    seen = {}\n    for i, n in enumerate(nums):\n        if target - n in seen:\n            return [seen[target - n], i]\n        seen[n] = i\n    return []',
-    javascript:
-      'function twoSum(nums, target) {\n  const seen = new Map()\n  for (let i = 0; i < nums.length; i++) {\n    const need = target - nums[i]\n    if (seen.has(need)) return [seen.get(need), i]\n    seen.set(nums[i], i)\n  }\n  return []\n}',
-    java:
-      'int[] twoSum(int[] nums, int target) {\n    Map<Integer, Integer> seen = new HashMap<>();\n    for (int i = 0; i < nums.length; i++) {\n        int need = target - nums[i];\n        if (seen.containsKey(need)) return new int[]{seen.get(need), i};\n        seen.put(nums[i], i);\n    }\n    return new int[]{};\n}',
-    cpp:
-      'vector<int> twoSum(vector<int>& nums, int target) {\n    unordered_map<int, int> seen;\n    for (int i = 0; i < nums.size(); i++) {\n        int need = target - nums[i];\n        if (seen.count(need)) return {seen[need], i};\n        seen[nums[i]] = i;\n    }\n    return {};\n}'
-  }
-  const approach =
-    a.tone === 'casual'
-      ? "So, I'd scan the array once, stash each value's index, and look for the complement — you know, the classic one-pass hash map."
-      : 'I would scan the array once, store each value and index in a hash map, and check for the complement at every step.'
-  const steps = [
-    'Create a map from value to index.',
-    'For each element, check whether target - value is already in the map.',
-    'If it is, return both indices; otherwise store the current index.',
-    'Return an empty result when no pair exists.'
-  ]
-  const stepText =
-    a.format === 'paragraph'
-      ? steps.map((step, i) => `${i + 1}. ${step}`).join(' ')
-      : steps.map((step, i) => `${i + 1}. ${step}`).join('\n')
-  const filler = a.fillerWords && a.tone !== 'formal' ? ' Honestly, that keeps it linear.' : ''
-  return `${approach}${filler}\n\n${stepText}\n\n${code[a.codeLanguage]}\n\nTime complexity: O(n). Space complexity: O(n).`
-}
 
 function structuredAnswerText(card: StructuredAnswer): string {
   const parts: string[] = []
@@ -338,94 +242,6 @@ const AnswerRow = memo(function AnswerRow({ answer, onRegenerate, onStop }: Answ
   )
 })
 
-function buildSystemPrompt(
-  cfg: AppConfig,
-  hasImageAttachment: boolean,
-  qType: ResolvedQuestionType
-): string {
-  const a = cfg.answer
-  const lengthRule =
-    a.length === 'concise'
-      ? 'Keep answers short: 50-80 words.'
-      : a.length === 'detailed'
-        ? 'Give a thorough answer: 150-220 words.'
-        : 'Aim for 80-140 words.'
-  const formatRule =
-    a.format === 'bullets'
-      ? 'When listing points, use tight bullet lines.'
-      : a.format === 'paragraph'
-        ? 'Answer in flowing prose without bullet lists.'
-        : 'Mix short paragraphs with a bullet list when it helps clarity.'
-  const toneRule =
-    a.tone === 'casual'
-      ? 'Use a natural, conversational tone.'
-      : a.tone === 'simple'
-        ? 'Use plain, simple language.'
-        : 'Use a professional, composed tone.'
-  const starRule =
-    a.star || qType === 'behavioral'
-      ? 'For behavioral questions, structure the answer as STAR (Situation, Task, Action, Result) without labeling the parts aloud.'
-      : ''
-  const fillerRule = a.fillerWords
-    ? 'Include light, natural spoken fillers ("honestly", "so", "you know") sparingly, no more than once or twice.'
-    : 'Avoid filler words; speak crisply.'
-
-  const profile = [
-    cfg.profile.background.trim() && `Candidate background:\n${clip(cfg.profile.background, 20000)}`,
-    cfg.profile.resume.trim() &&
-      `Resume (factual source for the candidate):\n${clip(cfg.profile.resume, 30000)}`
-  ]
-    .filter(Boolean)
-    .join('\n\n')
-
-  const session = [
-    cfg.session.company.trim() && `Company: ${cfg.session.company.trim()}`,
-    cfg.session.jobDescription.trim() &&
-      `Job description:\n${clip(cfg.session.jobDescription, 10000)}`,
-    cfg.session.extraContext.trim() &&
-      `Extra instructions:\n${clip(cfg.session.extraContext, 20000)}`
-  ]
-    .filter(Boolean)
-    .join('\n\n')
-
-  // Image turns only: an output protocol that overrides the spoken style for
-  // screenshots. Kept last so it is the most recent instruction; the global
-  // rules above (first person, never mention being an AI) still apply.
-  const imageRule = hasImageAttachment
-    ? qType === 'coding'
-      ? [
-          'An image is attached to this question. Read it completely before answering.',
-          'This is a coding question. Respond with ONLY a JSON object and no other text, using exactly this shape:',
-          `{"approach": "<=2 sentence first-person approach", "key_steps": ["..."], "code": {"language": "${a.codeLanguage}", "source": "..."}, "complexity": {"time": "...", "space": "..."}}`,
-          `Fill "approach" with at most two spoken-style first-person sentences. "key_steps" lists the algorithm steps in order. "code.source" is the complete, correct, runnable ${a.codeLanguage} solution, with NO markdown fences inside the JSON string. "complexity" gives big-O time and space. No trailing questions, offers, or meta commentary.`,
-          'These image rules take precedence over the Style word budget above.'
-        ].join('\n')
-      : [
-          'An image is attached to this question. Read it completely before answering.',
-          `- If the image contains a programming/coding problem: open with at most a 1-2 sentence first-person approach summary (spoken style), then IMMEDIATELY give the complete, correct, runnable solution in ONE code block in ${a.codeLanguage}. No trailing questions, no "want me to..." offers, no meta commentary, no restating the problem. If the approach is trivial, the code block can be the whole answer.`,
-          '- Else if the image is a multiple-choice question: state the selected answer (letter + text) FIRST, then at most one short line of justification.',
-          '- Else: fall back to the normal spoken-answer style.',
-          'These image rules take precedence over the Style word budget above.'
-        ].join('\n')
-    : ''
-
-  return [
-    "You are the user's live interview copilot. Your job: give a direct, speakable answer to the latest question in the call transcript.",
-    'Rules:',
-    '- Answer in the first person, natural spoken style, as the candidate.',
-    '- Be accurate; use only the provided context for facts. Never invent employers, dates, metrics, or achievements. Any number or metric you state must appear in the reference material above. If facts are missing, give a sensible framework and briefly note the gap.',
-    '- Never mention that you are an AI, a model, or a transcript.',
-    '- If no clear question is present, ask the user to repeat it in one short sentence.',
-    `Style: ${lengthRule} ${formatRule} ${toneRule} ${fillerRule}`,
-    starRule,
-    session && `Session context:\n${session}`,
-    profile && `About the candidate:\n${profile}`,
-    imageRule
-  ]
-    .filter(Boolean)
-    .join('\n')
-}
-
 // In-memory render cap; sessions keep everything retained. Raised for long interviews.
 const MAX_SEGMENTS = 2000
 
@@ -442,10 +258,6 @@ const AUTOSAVE_FILE_NAME = 'autosave.json'
 // Overall cap for letting in-flight finals land before End/quit saves.
 const CHAIN_DRAIN_TIMEOUT_MS = 4000
 
-function formatAccelerator(accelerator: string): string {
-  return accelerator.replace(/CommandOrControl/g, 'Ctrl')
-}
-
 const BADGE_LABELS: Record<SpeedBadge, string> = {
   recommended: 'Recommended',
   fast: 'Fast',
@@ -455,49 +267,6 @@ const BADGE_LABELS: Record<SpeedBadge, string> = {
 
 function badgeLabel(badge: SpeedBadge): string {
   return BADGE_LABELS[badge]
-}
-
-// Presets apply effort to the active profile; the legacy field is mirrored so
-// configs migrated later keep the same intent.
-function presetLlm(cfg: AppConfig, effort: 'low' | 'high'): AppConfig['llm'] {
-  return {
-    ...cfg.llm,
-    reasoningEffort: effort,
-    profiles: cfg.llm.profiles.map((profile) =>
-      profile.id === cfg.llm.activeProfileId ? { ...profile, effort } : profile
-    )
-  }
-}
-
-// Settings presets only patch the draft: the user still reviews and saves.
-// The model is intentionally never changed here.
-function applyPreset(cfg: AppConfig, preset: 'behavioral' | 'coding'): AppConfig {
-  if (preset === 'behavioral') {
-    return {
-      ...cfg,
-      llm: presetLlm(cfg, 'low'),
-      answer: {
-        ...cfg.answer,
-        length: 'balanced',
-        format: 'paragraph',
-        tone: 'casual',
-        star: true,
-        fillerWords: true
-      }
-    }
-  }
-  return {
-    ...cfg,
-    llm: presetLlm(cfg, 'high'),
-    answer: {
-      ...cfg.answer,
-      length: 'concise',
-      format: 'bullets',
-      tone: 'simple',
-      star: false,
-      fillerWords: false
-    }
-  }
 }
 
 function errorMessage(err: unknown): string {
@@ -576,74 +345,10 @@ const HALLUCINATIONS = new Set([
   'okay'
 ])
 
-function similarity(a: string, b: string): number {
-  const tokenize = (text: string): Set<string> =>
-    new Set(
-      text
-        .toLowerCase()
-        .replace(/[.!?]+$/, '')
-        .split(/\s+/)
-        .filter((w) => w.length > 2)
-    )
-  const left = tokenize(a)
-  const right = tokenize(b)
-  let intersection = 0
-  for (const w of left) if (right.has(w)) intersection++
-  const union = left.size + right.size - intersection
-  return union > 0 ? intersection / union : 0
-}
-
-function isQuestion(text: string): boolean {
-  const t = text.trim()
-  if (!t) return false
-  if (t.includes('?')) return true
-  const normalized = t.toLowerCase()
-  if (
-    /(a time when|a time you|tell me about|walk me through|experience with|example of|greatest strength|greatest weakness)/.test(
-      normalized
-    )
-  ) {
-    return true
-  }
-  return /^(?:\S+\s+){0,2}(what|how|why|when|where|who|which|can|could|would|do|did|have|are)\b/i.test(
-    t
-  )
-}
-
-function looksCompleteQuestion(text: string): boolean {
-  const t = text.trim()
-  if (!t.endsWith('?')) return false
-  const words = t.split(/\s+/).filter((w) => /[a-z0-9]/i.test(w))
-  return words.length >= 5
-}
-
 function uid(): string {
   return typeof crypto.randomUUID === 'function'
     ? crypto.randomUUID()
     : Math.random().toString(36).slice(2)
-}
-
-interface SessionSummary {
-  name: string
-  title: string
-  company: string
-  endedAt: string | null
-  segments: number
-  answers: number
-}
-
-interface SessionData {
-  title?: string
-  company?: string
-  endedAt?: string
-  segments?: Array<{ id?: string; speaker: string; text: string; ts: number }>
-  answers?: Array<{
-    text: string
-    error?: string
-    question?: string
-    anchorId?: string
-    images?: string[]
-  }>
 }
 
 export default function App() {
@@ -968,21 +673,12 @@ export default function App() {
   // transcript carry-over in the remaining budget.
   // OpenAI whisper-1 prompt limit is 224 tokens; 700 chars is safe headroom.
   const whisperPrompt = useCallback((speaker: Speaker): string => {
-    const carry = promptRef.current[speaker]
     const cfg = configRef.current
-    const company = (cfg?.session.company ?? '').replace(/\s+/g, ' ').trim()
-    const vocabulary = (cfg?.profile.vocabulary ?? '').replace(/\s+/g, ' ').trim()
-    const prefix = [
-      company && `Company: ${company}.`,
-      vocabulary && `Terms: ${vocabulary}.`
-    ]
-      .filter(Boolean)
-      .join(' ')
-    if (!prefix) return carry
-    const budget = 700
-    const clipped = prefix.slice(0, budget)
-    const room = Math.max(0, budget - clipped.length - 1)
-    return `${clipped}${room > 0 && carry ? ` ${carry.slice(-room)}` : ''}`.slice(0, budget)
+    return buildWhisperPrompt({
+      company: cfg?.session.company,
+      vocabulary: cfg?.profile.vocabulary,
+      carry: promptRef.current[speaker]
+    })
   }, [])
 
   // Keep the last four Them WAVs as headerless 16 kHz mono 16-bit PCM so a
@@ -1672,6 +1368,9 @@ export default function App() {
       profile: { resume, background, vocabulary }
     })
     setConfig(next)
+    // `next` is the authoritative merged config for this start; configRef only
+    // updates on the next render, which is too late for startCapture's reads.
+    configRef.current = next
     await startCapture()
   }, [
     view,
@@ -1942,6 +1641,18 @@ export default function App() {
     },
     [showToast]
   )
+
+  // Detail loading stays in App so HistoryView stays presentational.
+  const openHistorySession = useCallback((name: string) => {
+    void (async () => {
+      try {
+        const data = (await window.api.getSession(name)) as SessionData
+        setHistoryDetail(data)
+      } catch (err) {
+        setError(errorMessage(err))
+      }
+    })()
+  }, [])
 
   const deleteAllSessions = useCallback(async () => {
     if (!pendingDeleteAll) {
@@ -2564,8 +2275,12 @@ export default function App() {
         )}
 
         {view === 'settings' && (
-          <Settings
+          <SettingsView
             config={config}
+            badgeLabel={badgeLabel}
+            newId={uid}
+            errorMessage={errorMessage}
+            runCaptureChecks={runRendererCaptureChecks}
             onToast={showToast}
             onSave={async (draft) => {
               const next = await window.api.setConfig({
@@ -2583,1067 +2298,25 @@ export default function App() {
         )}
 
         {view === 'history' && (
-          <div className="history">
-            {historyDetail ? (
-              <>
-                <div className="row gap history-head">
-                  <button className="btn tiny" onClick={() => setHistoryDetail(null)}>
-                    Back
-                  </button>
-                  <strong>{historyDetail.title ?? 'Session'}</strong>
-                  <span className="hint small">
-                    {historyDetail.endedAt
-                      ? new Date(historyDetail.endedAt).toLocaleString()
-                      : ''}
-                  </span>
-                </div>
-                <div className="scroll">
-                  {(() => {
-                    const segments = historyDetail.segments ?? []
-                    const answerList = historyDetail.answers ?? []
-                    const byAnchor = new Map<string, typeof answerList>()
-                    const loose: typeof answerList = []
-                    for (const answer of answerList) {
-                      if (answer.anchorId) {
-                        const list = byAnchor.get(answer.anchorId) ?? []
-                        list.push(answer)
-                        byAnchor.set(answer.anchorId, list)
-                      } else {
-                        loose.push(answer)
-                      }
-                    }
-                    const items: Array<
-                      | { kind: 'seg'; key: string; speaker: string; text: string }
-                      | {
-                          kind: 'ans'
-                          key: string
-                          text: string
-                          images?: string[]
-                          card?: StructuredAnswer
-                        }
-                    > = []
-                    const answerItem = (answer: (typeof answerList)[number], key: string) => ({
-                      kind: 'ans' as const,
-                      key,
-                      text: answer.text || answer.error || '',
-                      images: answer.images,
-                      card: answer.error
-                        ? undefined
-                        : parseStructuredAnswer(answer.text ?? '') ?? undefined
-                    })
-                    segments.forEach((segment, index) => {
-                      items.push({
-                        kind: 'seg',
-                        key: `s${index}`,
-                        speaker: segment.speaker,
-                        text: segment.text
-                      })
-                      if (!segment.id) return
-                      const anchored = byAnchor.get(segment.id)
-                      if (anchored) {
-                        anchored.forEach((answer, answerIndex) =>
-                          items.push(answerItem(answer, `s${index}a${answerIndex}`))
-                        )
-                        byAnchor.delete(segment.id)
-                      }
-                    })
-                    let extra = 0
-                    for (const list of byAnchor.values()) {
-                      for (const answer of list) {
-                        items.push(answerItem(answer, `x${extra++}`))
-                      }
-                    }
-                    for (const answer of loose) {
-                      items.push(answerItem(answer, `l${extra++}`))
-                    }
-                    return items.map((item) =>
-                      item.kind === 'seg' ? (
-                        <div key={item.key} className="seg">
-                          <span className={`speaker ${item.speaker === 'You' ? 'you' : 'them'}`}>
-                            {item.speaker}
-                          </span>
-                          <span className="seg-text">{item.text}</span>
-                        </div>
-                      ) : (
-                        <div key={item.key} className="answer">
-                          <div className="answer-head">
-                            <span className="speaker answer-tag">Answer</span>
-                            {item.card && <span className="answer-kind">coded</span>}
-                          </div>
-                          {item.card ? (
-                            <StructuredAnswerCard card={item.card} />
-                          ) : (
-                            <div className="answer-text">{item.text}</div>
-                          )}
-                          {item.images && item.images.length > 0 && (
-                            <div className="attachments history-images">
-                              {item.images.map((url, imageIndex) => (
-                                <img
-                                  key={imageIndex}
-                                  className="thumb"
-                                  src={url}
-                                  alt={`Screenshot ${imageIndex + 1}`}
-                                  title="Screenshot"
-                                />
-                              ))}
-                            </div>
-                          )}
-                        </div>
-                      )
-                    )
-                  })()}
-                </div>
-              </>
-            ) : (
-              <>
-                <div className="row gap history-head">
-                  <button className="btn tiny" onClick={() => setView('home')}>
-                    Back
-                  </button>
-                  <strong>Session history</strong>
-                  {historyList.length > 0 && (
-                    <button
-                      className="btn tiny danger"
-                      style={{ marginLeft: 'auto' }}
-                      onClick={() => void deleteAllSessions()}
-                    >
-                      {pendingDeleteAll ? 'Confirm delete all' : 'Delete all'}
-                    </button>
-                  )}
-                </div>
-                <div className="scroll">
-                  {historyLoading && <div className="empty">Loading…</div>}
-                  {!historyLoading && historyList.length === 0 && (
-                    <div className="empty">No saved sessions yet. End a session to save it.</div>
-                  )}
-                  {historyList.map((session) => (
-                    <div key={session.name} className="history-row">
-                      <button
-                        className="history-item"
-                        onClick={() => {
-                          void (async () => {
-                            try {
-                              const data = (await window.api.getSession(session.name)) as SessionData
-                              setHistoryDetail(data)
-                            } catch (err) {
-                              setError(errorMessage(err))
-                            }
-                          })()
-                        }}
-                      >
-                        <div className="history-title">{session.title}</div>
-                        <div className="hint small">
-                          {session.endedAt
-                            ? new Date(session.endedAt).toLocaleString()
-                            : 'unknown date'}{' '}
-                          · {session.segments} transcript · {session.answers} answers
-                        </div>
-                      </button>
-                      <button
-                        className="btn tiny"
-                        title="Export this session as Markdown"
-                        onClick={() => void exportSession(session.name)}
-                      >
-                        Export
-                      </button>
-                      <button
-                        className="btn tiny danger"
-                        title="Delete this session"
-                        onClick={() => void deleteSession(session.name)}
-                      >
-                        {pendingDelete === session.name ? 'Confirm' : 'Delete'}
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              </>
-            )}
-          </div>
+          <HistoryView
+            detail={historyDetail}
+            sessions={historyList}
+            loading={historyLoading}
+            pendingDelete={pendingDelete}
+            pendingDeleteAll={pendingDeleteAll}
+            onOpen={openHistorySession}
+            onCloseDetail={() => setHistoryDetail(null)}
+            onBackHome={() => setView('home')}
+            onDelete={(name) => void deleteSession(name)}
+            onExport={(name) => void exportSession(name)}
+            onDeleteAll={() => void deleteAllSessions()}
+            AnswerCard={StructuredAnswerCard}
+          />
         )}
       </div>
     </div>
   )
 }
 
-function Settings({
-  config,
-  onToast,
-  onSave,
-  onBack,
-  onClear
-}: {
-  config: AppConfig
-  onToast: (message: string) => void
-  onSave: (draft: AppConfig) => Promise<void>
-  onBack: () => void
-  onClear: () => void
-}) {
-  const [draft, setDraft] = useState<AppConfig>(config)
-  const [captureTest, setCaptureTest] = useState<CaptureTestReport | null>(null)
-  const [captureTesting, setCaptureTesting] = useState(false)
-  const [hotkeys, setHotkeys] = useState<HotkeyInfo[]>([])
 
-  // Background config writes (hotkeys, click-through, meeting toggles) must not
-  // clobber edits in progress: only re-sync when the draft is clean.
-  const draftRef = useRef(draft)
-  const syncedConfigRef = useRef(config)
-  draftRef.current = draft
 
-  useEffect(() => {
-    if (JSON.stringify(draftRef.current) !== JSON.stringify(syncedConfigRef.current)) return
-    syncedConfigRef.current = config
-    setDraft(config)
-  }, [config])
-
-  useEffect(() => {
-    void window.api
-      .getHotkeys()
-      .then(setHotkeys)
-      .catch(() => undefined)
-  }, [])
-
-  const set = <K extends keyof AppConfig>(key: K, value: AppConfig[K]): void => {
-    setDraft((prev) => ({ ...prev, [key]: value }))
-  }
-  const setLlm = <K extends keyof AppConfig['llm']>(key: K, value: AppConfig['llm'][K]): void => {
-    setDraft((prev) => ({ ...prev, llm: { ...prev.llm, [key]: value } }))
-  }
-  const setAsr = <K extends keyof AppConfig['asr']>(key: K, value: AppConfig['asr'][K]): void => {
-    setDraft((prev) => ({ ...prev, asr: { ...prev.asr, [key]: value } }))
-  }
-  const setInteraction = <K extends keyof AppConfig['interaction']>(
-    key: K,
-    value: AppConfig['interaction'][K]
-  ): void => {
-    setDraft((prev) => ({ ...prev, interaction: { ...prev.interaction, [key]: value } }))
-  }
-  const setAnswer = <K extends keyof AppConfig['answer']>(
-    key: K,
-    value: AppConfig['answer'][K]
-  ): void => {
-    setDraft((prev) => ({ ...prev, answer: { ...prev.answer, [key]: value } }))
-  }
-  const setMeetings = (key: keyof AppConfig['meetings'], value: boolean): void => {
-    setDraft((prev) => ({ ...prev, meetings: { ...prev.meetings, [key]: value } }))
-  }
-
-  // --- Model profile editing (saved with the rest of the draft) ------------
-  const [advanced, setAdvanced] = useState<Record<string, boolean>>({})
-  const [pickingModel, setPickingModel] = useState(false)
-  // Remember the last numeric value while a field is omitted, so toggling Omit
-  // restores it instead of a hard-coded default.
-  const [lastNumbers, setLastNumbers] = useState<
-    Record<string, { temperature?: number; maxTokens?: number }>
-  >({})
-
-  const updateProfile = (id: string, patch: Partial<ModelProfile>): void => {
-    setDraft((prev) => ({
-      ...prev,
-      llm: {
-        ...prev.llm,
-        profiles: prev.llm.profiles.map((profile) =>
-          profile.id === id ? { ...profile, ...patch } : profile
-        )
-      }
-    }))
-  }
-
-  const rememberNumber = (
-    id: string,
-    key: 'temperature' | 'maxTokens',
-    value: number
-  ): void => {
-    setLastNumbers((prev) => ({
-      ...prev,
-      [id]: {
-        ...prev[id],
-        ...(key === 'temperature' ? { temperature: value } : { maxTokens: value })
-      }
-    }))
-  }
-
-  const setProfileNumber = (
-    id: string,
-    key: 'temperature' | 'maxTokens',
-    value: number | null
-  ): void => {
-    if (value != null) rememberNumber(id, key, value)
-    if (key === 'temperature') updateProfile(id, { temperature: value })
-    else updateProfile(id, { maxTokens: value })
-  }
-
-  const toggleOmit = (
-    profile: ModelProfile,
-    key: 'temperature' | 'maxTokens',
-    omit: boolean
-  ): void => {
-    if (!omit) {
-      const fallback = key === 'temperature' ? 0.2 : 4096
-      setProfileNumber(profile.id, key, lastNumbers[profile.id]?.[key] ?? fallback)
-      return
-    }
-    const current = key === 'temperature' ? profile.temperature : profile.maxTokens
-    if (current != null) rememberNumber(profile.id, key, current)
-    updateProfile(
-      profile.id,
-      key === 'temperature' ? { temperature: null } : { maxTokens: null }
-    )
-  }
-
-  const addProfile = (profile: ModelProfile): void => {
-    setDraft((prev) => ({
-      ...prev,
-      llm: { ...prev.llm, profiles: [...prev.llm.profiles, profile] }
-    }))
-    setPickingModel(false)
-  }
-
-  const addCatalogProfile = (entry: ModelCatalogEntry): void => {
-    addProfile({
-      id: uid(),
-      label: entry.label,
-      badge: entry.badge,
-      baseUrl: entry.baseUrl,
-      apiKey: '',
-      model: entry.model,
-      // Anthropic 5.x rejects temperature: the catalog flag decides.
-      temperature: entry.supportsTemperature ? 0.2 : null,
-      maxTokens: 4096,
-      effort: entry.effort,
-      escalateOnCode: false
-    })
-  }
-
-  const addCustomProfile = (): void => {
-    addProfile({
-      id: uid(),
-      label: 'Custom / OpenRouter',
-      badge: 'recommended',
-      baseUrl: '',
-      apiKey: '',
-      model: '',
-      // Blank fields stay omitted until the user chooses values.
-      temperature: null,
-      maxTokens: null,
-      effort: 'default',
-      escalateOnCode: false
-    })
-  }
-
-  const removeProfile = (id: string): void => {
-    setDraft((prev) => {
-      if (prev.llm.profiles.length <= 1) return prev
-      const profiles = prev.llm.profiles.filter((profile) => profile.id !== id)
-      return {
-        ...prev,
-        llm: {
-          ...prev.llm,
-          profiles,
-          activeProfileId:
-            prev.llm.activeProfileId === id ? profiles[0].id : prev.llm.activeProfileId
-        }
-      }
-    })
-  }
-
-  const activateProfile = (id: string): void => {
-    setDraft((prev) => ({ ...prev, llm: { ...prev.llm, activeProfileId: id } }))
-  }
-
-  const runCaptureTest = async (): Promise<void> => {
-    setCaptureTesting(true)
-    try {
-      const rendererChecks = await runRendererCaptureChecks()
-      let mainChecks: CaptureTestCheck[] = []
-      let ranAt = Date.now()
-      try {
-        const report = await window.api.testCapture()
-        mainChecks = report.checks
-        ranAt = report.ranAt
-      } catch (err) {
-        mainChecks = [
-          {
-            id: 'main-test',
-            label: 'Main-process checks',
-            pass: false,
-            detail: errorMessage(err)
-          }
-        ]
-      }
-      setCaptureTest({ checks: [...mainChecks, ...rendererChecks], ranAt })
-    } catch (err) {
-      setCaptureTest({
-        checks: [
-          {
-            id: 'capture-test',
-            label: 'Capture self-test',
-            pass: false,
-            detail: errorMessage(err)
-          }
-        ],
-        ranAt: Date.now()
-      })
-    } finally {
-      setCaptureTesting(false)
-    }
-  }
-
-  return (
-    <div className="settings">
-      <div className="settings-scroll">
-        <h3>Interview presets</h3>
-        <div className="row gap">
-          <button
-            className="btn"
-            onClick={() => setDraft((prev) => applyPreset(prev, 'behavioral'))}
-          >
-            Behavioral
-          </button>
-          <button
-            className="btn"
-            onClick={() => setDraft((prev) => applyPreset(prev, 'coding'))}
-          >
-            Coding
-          </button>
-        </div>
-        <p className="hint small">Presets change effort and answer style only — the model is not changed.</p>
-
-        <h3>Models</h3>
-        <p className="hint small">
-          Each profile is a full endpoint identity (base URL, key, model, sampling). The active
-          profile is used for new questions; switch it from the live-view header — no restart, and
-          it never interrupts a streaming answer.
-        </p>
-        {draft.llm.profiles.map((profile) => {
-          const isActive = profile.id === draft.llm.activeProfileId
-          const showAdvanced = Boolean(advanced[profile.id])
-          return (
-            <div className={`profile-card${isActive ? ' active' : ''}`} key={profile.id}>
-              <div className="profile-head">
-                <input
-                  className="profile-label"
-                  value={profile.label}
-                  aria-label="Profile label"
-                  onChange={(e) => updateProfile(profile.id, { label: e.target.value })}
-                />
-                <span className={`badge ${profile.badge}`}>{badgeLabel(profile.badge)}</span>
-                <button
-                  className="btn tiny"
-                  title={isActive ? 'This profile answers new questions' : 'Use this profile'}
-                  disabled={isActive}
-                  onClick={() => activateProfile(profile.id)}
-                >
-                  {isActive ? 'Active' : 'Use'}
-                </button>
-              </div>
-              <span className="mono profile-model">{profile.model || '(no model id yet)'}</span>
-              <label className="field">
-                <span>Model ID</span>
-                <input
-                  value={profile.model}
-                  onChange={(e) => updateProfile(profile.id, { model: e.target.value })}
-                  placeholder="gemini-3.8-flash"
-                />
-              </label>
-              <label className="field">
-                <span>API key</span>
-                <input
-                  type="password"
-                  value={profile.apiKey}
-                  onChange={(e) => updateProfile(profile.id, { apiKey: e.target.value })}
-                  placeholder="sk-…"
-                />
-              </label>
-              <button
-                className="btn tiny ghost"
-                onClick={() => setAdvanced((prev) => ({ ...prev, [profile.id]: !showAdvanced }))}
-              >
-                {showAdvanced ? 'Advanced ▲' : 'Advanced ▼'}
-              </button>
-              {showAdvanced && (
-                <div className="profile-advanced">
-                  <label className="field">
-                    <span>Base URL</span>
-                    <input
-                      value={profile.baseUrl}
-                      onChange={(e) => updateProfile(profile.id, { baseUrl: e.target.value })}
-                      placeholder="https://api.openai.com/v1"
-                    />
-                  </label>
-                  <div className="grid2">
-                    <label className="field">
-                      <span>Temperature (0–1)</span>
-                      <input
-                        type="number"
-                        step="0.05"
-                        min="0"
-                        max="1"
-                        placeholder="omitted"
-                        value={profile.temperature ?? ''}
-                        onChange={(e) => {
-                          if (e.target.value === '') {
-                            toggleOmit(profile, 'temperature', true)
-                            return
-                          }
-                          const parsed = Number(e.target.value)
-                          if (Number.isFinite(parsed)) {
-                            setProfileNumber(profile.id, 'temperature', parsed)
-                          }
-                        }}
-                      />
-                    </label>
-                    <label className="field">
-                      <span>Max tokens (128–8192)</span>
-                      <input
-                        type="number"
-                        step="64"
-                        min="128"
-                        max="8192"
-                        placeholder="omitted"
-                        value={profile.maxTokens ?? ''}
-                        onChange={(e) => {
-                          if (e.target.value === '') {
-                            toggleOmit(profile, 'maxTokens', true)
-                            return
-                          }
-                          const parsed = Number(e.target.value)
-                          if (Number.isFinite(parsed)) {
-                            setProfileNumber(profile.id, 'maxTokens', parsed)
-                          }
-                        }}
-                      />
-                    </label>
-                  </div>
-                  <label className="check">
-                    <input
-                      type="checkbox"
-                      checked={profile.temperature === null}
-                      onChange={(e) => toggleOmit(profile, 'temperature', e.target.checked)}
-                    />
-                    <span>Omit temperature — let the vendor pick its default</span>
-                  </label>
-                  <label className="check">
-                    <input
-                      type="checkbox"
-                      checked={profile.maxTokens === null}
-                      onChange={(e) => toggleOmit(profile, 'maxTokens', e.target.checked)}
-                    />
-                    <span>Omit max tokens</span>
-                  </label>
-                  <label className="field">
-                    <span>Reasoning effort</span>
-                    <select
-                      value={profile.effort}
-                      onChange={(e) =>
-                        updateProfile(profile.id, { effort: e.target.value as EffortSetting })
-                      }
-                    >
-                      <option value="default">Default — omit (vendor decides)</option>
-                      <option value="low">Low — fast</option>
-                      <option value="medium">Medium — balanced</option>
-                      <option value="high">High — hard questions (slower)</option>
-                    </select>
-                  </label>
-                  <label className="check">
-                    <input
-                      type="checkbox"
-                      checked={profile.escalateOnCode}
-                      onChange={(e) =>
-                        updateProfile(profile.id, { escalateOnCode: e.target.checked })
-                      }
-                    />
-                    <span>Escalate low → high for coding/screenshot questions</span>
-                  </label>
-                  <button
-                    className="btn tiny danger"
-                    disabled={draft.llm.profiles.length <= 1}
-                    onClick={() => removeProfile(profile.id)}
-                  >
-                    Delete profile
-                  </button>
-                </div>
-              )}
-            </div>
-          )
-        })}
-        <div className="row gap">
-          <button className="btn" onClick={() => setPickingModel((open) => !open)}>
-            {pickingModel ? 'Close catalog' : 'Add model'}
-          </button>
-          <span className="hint small">
-            Badges show expected speed. Anthropic 5.x profiles omit temperature and effort.
-          </span>
-        </div>
-        {pickingModel && (
-          <div className="catalog">
-            {MODEL_CATALOG.map((entry) => (
-              <button
-                key={entry.model}
-                className="catalog-item"
-                onClick={() => addCatalogProfile(entry)}
-              >
-                <span className={`badge ${entry.badge}`}>{badgeLabel(entry.badge)}</span>
-                <span className="catalog-label">{entry.label}</span>
-                <span className="catalog-vendor">{entry.vendor}</span>
-                <span className="mono catalog-model">{entry.model}</span>
-              </button>
-            ))}
-            <button className="catalog-item custom" onClick={addCustomProfile}>
-              <span className="catalog-label">Custom / OpenRouter…</span>
-              <span className="catalog-vendor">manual — blank fields</span>
-            </button>
-          </div>
-        )}
-        <label className="check">
-          <input
-            type="checkbox"
-            checked={draft.llm.vision}
-            onChange={(e) => setLlm('vision', e.target.checked)}
-          />
-          <span>Active model supports images (needed for screenshots in answers)</span>
-        </label>
-        <p className="hint small">
-          Vision models only, e.g. Gemini Flash, GPT-6.1, qwen2.5vl. Vision is app-wide, not
-          per-profile.
-        </p>
-        <label className="field">
-          <span>Code language</span>
-          <select
-            value={draft.answer.codeLanguage}
-            onChange={(e) =>
-              setAnswer('codeLanguage', e.target.value as AppConfig['answer']['codeLanguage'])
-            }
-          >
-            <option value="python">Python</option>
-            <option value="javascript">JavaScript</option>
-            <option value="java">Java</option>
-            <option value="cpp">C++</option>
-          </select>
-        </label>
-
-        <h3>Answer style</h3>
-        <div className="grid2">
-          <label className="field">
-            <span>Length</span>
-            <select
-              value={draft.answer.length}
-              onChange={(e) => setAnswer('length', e.target.value as AppConfig['answer']['length'])}
-            >
-              <option value="concise">Concise</option>
-              <option value="balanced">Balanced</option>
-              <option value="detailed">Detailed</option>
-            </select>
-          </label>
-          <label className="field">
-            <span>Format</span>
-            <select
-              value={draft.answer.format}
-              onChange={(e) => setAnswer('format', e.target.value as AppConfig['answer']['format'])}
-            >
-              <option value="bullets">Bullets</option>
-              <option value="balanced">Balanced</option>
-              <option value="paragraph">Paragraph</option>
-            </select>
-          </label>
-        </div>
-        <label className="field">
-          <span>Tone</span>
-          <select
-            value={draft.answer.tone}
-            onChange={(e) => setAnswer('tone', e.target.value as AppConfig['answer']['tone'])}
-          >
-            <option value="formal">Formal</option>
-            <option value="casual">Casual</option>
-            <option value="simple">Simple</option>
-          </select>
-        </label>
-        <label className="check">
-          <input
-            type="checkbox"
-            checked={draft.answer.star}
-            onChange={(e) => setAnswer('star', e.target.checked)}
-          />
-          <span>Use STAR structure for behavioral answers</span>
-        </label>
-        <label className="check">
-          <input
-            type="checkbox"
-            checked={draft.answer.fillerWords}
-            onChange={(e) => setAnswer('fillerWords', e.target.checked)}
-          />
-          <span>Allow natural filler words (sounds less scripted)</span>
-        </label>
-
-        <div className="answer-preview">
-          <div className="answer-preview-head">
-            <span className="label">Answer preview</span>
-            <span className="hint small">Static sample — no model call</span>
-          </div>
-          <div className="answer-preview-sample">
-            <span className="label">Behavioral</span>
-            <pre className="answer-preview-body">{sampleBehavioral(draft.answer)}</pre>
-          </div>
-          <div className="answer-preview-sample">
-            <span className="label">Coding · {draft.answer.codeLanguage}</span>
-            <pre className="answer-preview-body code">{sampleCoding(draft.answer)}</pre>
-          </div>
-        </div>
-
-        <h3>Speech-to-text</h3>
-        <label className="field">
-          <span>Backend</span>
-          <select
-            value={draft.asr.mode}
-            onChange={(e) => setAsr('mode', e.target.value as AppConfig['asr']['mode'])}
-          >
-            <option value="whispercpp">whisper.cpp server (local)</option>
-            <option value="openai">OpenAI-compatible transcription</option>
-          </select>
-        </label>
-        <label className="field">
-          <span>Endpoint</span>
-          <input
-            value={draft.asr.url}
-            onChange={(e) => setAsr('url', e.target.value)}
-            placeholder="http://127.0.0.1:8080/inference"
-          />
-        </label>
-        <label className="field">
-          <span>API key (optional)</span>
-          <input
-            type="password"
-            value={draft.asr.apiKey}
-            onChange={(e) => setAsr('apiKey', e.target.value)}
-          />
-        </label>
-        <label className="field">
-          <span>Model (OpenAI-compatible mode)</span>
-          <input
-            value={draft.asr.model}
-            onChange={(e) => setAsr('model', e.target.value)}
-            placeholder="whisper-1"
-          />
-        </label>
-
-        <h3>Overlay</h3>
-        <label className="check">
-          <input
-            type="checkbox"
-            checked={draft.privateMode}
-            onChange={(e) => set('privateMode', e.target.checked)}
-          />
-          <span>Screen-capture protection (window excluded from sharing/recording)</span>
-        </label>
-        <label className="check">
-          <input
-            type="checkbox"
-            checked={draft.clickThrough}
-            onChange={(e) => set('clickThrough', e.target.checked)}
-          />
-          <span>Click-through (mouse passes to apps below; Ctrl+Shift+F9 toggles)</span>
-        </label>
-        <label className="field">
-          <span>Panel opacity: {Math.round(draft.panelOpacity * 100)}%</span>
-          <input
-            type="range"
-            min="0.3"
-            max="1"
-            step="0.02"
-            value={draft.panelOpacity}
-            onChange={(e) => set('panelOpacity', Number(e.target.value))}
-          />
-        </label>
-
-        <h3>Display</h3>
-        <label className="field">
-          <span>Start on</span>
-          <select
-            value={draft.window.screenMode}
-            onChange={(e) =>
-              setDraft((prev) => ({
-                ...prev,
-                window: { ...prev.window, screenMode: e.target.value as 'primary' | 'cursor' }
-              }))
-            }
-          >
-            <option value="primary">Primary monitor</option>
-            <option value="cursor">Monitor under cursor</option>
-          </select>
-        </label>
-        <div className="row gap">
-          <button
-            className="btn"
-            onClick={async () => {
-              await window.api.moveToCursorDisplay()
-              onToast('Moved to the cursor screen')
-            }}
-          >
-            Move to cursor screen
-          </button>
-          <span className="hint small">Hotkey: Ctrl+Shift+M</span>
-        </div>
-
-        <h3>Hotkeys</h3>
-        <div className="hotkey-list">
-          {hotkeys.map((hotkey) => (
-            <div className="hotkey-row" key={hotkey.accelerator}>
-              <span className="hotkey-keys">
-                {formatAccelerator(hotkey.accelerator)
-                  .split('+')
-                  .map((part) => (
-                    <kbd key={part}>{part}</kbd>
-                  ))}
-              </span>
-              <span className="hotkey-desc">
-                {hotkey.description}
-                {!hotkey.registered && (
-                  <span className="hotkey-warn"> ⚠️ in use by another app</span>
-                )}
-              </span>
-            </div>
-          ))}
-        </div>
-
-        <h3>Meetings</h3>
-        <label className="check">
-          <input
-            type="checkbox"
-            checked={draft.meetings.detect}
-            onChange={(e) => setMeetings('detect', e.target.checked)}
-          />
-          <span>
-            Detect meeting apps (Zoom, Teams, Webex, Discord, Slack, Chime, Lark, WhatsApp)
-          </span>
-        </label>
-        <label className="check">
-          <input
-            type="checkbox"
-            checked={draft.meetings.autoStart}
-            onChange={(e) => setMeetings('autoStart', e.target.checked)}
-          />
-          <span>Start listening automatically when a meeting is detected</span>
-        </label>
-        <label className="check">
-          <input
-            type="checkbox"
-            checked={draft.meetings.balloon}
-            onChange={(e) => setMeetings('balloon', e.target.checked)}
-          />
-          <span>Show meeting-detection notification (visible during screen shares)</span>
-        </label>
-
-        <h3>Updates (optional)</h3>
-        <label className="check">
-          <input
-            type="checkbox"
-            checked={draft.updates.enabled}
-            onChange={(e) =>
-              setDraft((prev) => ({
-                ...prev,
-                updates: { ...prev.updates, enabled: e.target.checked }
-              }))
-            }
-          />
-          <span>Check for updates from a published feed</span>
-        </label>
-        <label className="field">
-          <span>Feed URL</span>
-          <input
-            value={draft.updates.feedUrl}
-            onChange={(e) =>
-              setDraft((prev) => ({ ...prev, updates: { ...prev.updates, feedUrl: e.target.value } }))
-            }
-            placeholder="https://example.com/updates/"
-          />
-        </label>
-        <div className="row gap">
-          <button
-            className="btn"
-            onClick={async () => {
-              const result = await window.api.checkForUpdates()
-              onToast(
-                result.ok
-                  ? `Update check: ${result.version ?? 'up to date'}`
-                  : `Update check failed: ${result.error ?? 'unknown error'}`
-              )
-            }}
-          >
-            Check now
-          </button>
-          <span className="hint small">
-            Feed must host electron-builder artifacts (latest.yml + installer).
-          </span>
-        </div>
-
-        <h3>Connections</h3>
-        <div className="row gap">
-          <button
-            className="btn"
-            onClick={async () => {
-              const result = await window.api.testLlm()
-              onToast(
-                result.ok ? `LLM OK: ${result.text}` : `LLM failed: ${result.error ?? 'unknown'}`
-              )
-            }}
-          >
-            Test LLM
-          </button>
-          <button
-            className="btn"
-            onClick={async () => {
-              const result = await window.api.testAsr()
-              onToast(result.ok ? 'Speech endpoint OK' : `Speech failed: ${result.error ?? 'unknown'}`)
-            }}
-          >
-            Test speech
-          </button>
-        </div>
-
-        <h3>Capture self-test</h3>
-        <div className="row gap">
-          <button className="btn" disabled={captureTesting} onClick={() => void runCaptureTest()}>
-            {captureTesting ? 'Testing…' : 'Run capture self-test'}
-          </button>
-          <span className="hint small">Runs invisibly — no window, picker or prompt appears.</span>
-        </div>
-        {captureTest && (
-          <div className="test-results">
-            {captureTest.checks.map((check) => (
-              <div className="test-check" key={check.id}>
-                <span
-                  className={`test-mark ${
-                    check.pass === true ? 'pass' : check.pass === false ? 'fail' : 'skip'
-                  }`}
-                >
-                  {check.pass === true ? '✓' : check.pass === false ? '✗' : '–'}
-                </span>
-                <span className="test-check-body">
-                  <span className="test-check-label">{check.label}</span>
-                  <span className="test-check-detail">{check.detail}</span>
-                </span>
-              </div>
-            ))}
-          </div>
-        )}
-
-        <h3>Behavior</h3>
-        <label className="check">
-          <input
-            type="checkbox"
-            checked={draft.interaction.earlyAnswer}
-            onChange={(e) => setInteraction('earlyAnswer', e.target.checked)}
-          />
-          <span>Answer as soon as a question is recognized (early trigger; requires Auto Answer)</span>
-        </label>
-        <label className="check">
-          <input
-            type="checkbox"
-            checked={draft.interaction.streamingPartials}
-            onChange={(e) => setInteraction('streamingPartials', e.target.checked)}
-          />
-          <span>Live partial transcripts (updates while the person is still speaking; extra GPU use)</span>
-        </label>
-        <label className="check">
-          <input
-            type="checkbox"
-            checked={draft.interaction.transcribeMic}
-            onChange={(e) => setInteraction('transcribeMic', e.target.checked)}
-          />
-          <span>
-            Transcribe microphone ("You") — off by default; the interviewer is captured from the
-            system-audio loopback
-          </span>
-        </label>
-        <label className="check">
-          <input
-            type="checkbox"
-            checked={draft.interaction.autoScroll}
-            onChange={(e) => setInteraction('autoScroll', e.target.checked)}
-          />
-          <span>Auto-scroll answers (follow new content; pauses while you scroll up)</span>
-        </label>
-        <label className="check">
-          <input
-            type="checkbox"
-            checked={draft.interaction.autoAnswer}
-            onChange={(e) => setInteraction('autoAnswer', e.target.checked)}
-          />
-          <span>Auto Answer (beta) — answer detected questions automatically</span>
-        </label>
-        <label className="field">
-          <span>Auto-answer cooldown (ms)</span>
-          <input
-            type="number"
-            step="500"
-            min="1000"
-            max="30000"
-            value={draft.interaction.answerCooldownMs}
-            onChange={(e) => {
-              // Clamp in the draft so the field never shows a value main will
-              // silently clamp on save (same 1000–30000 bounds).
-              const next = Math.round(Number(e.target.value))
-              setInteraction(
-                'answerCooldownMs',
-                Number.isFinite(next) ? Math.min(30000, Math.max(1000, next)) : 5000
-              )
-            }}
-          />
-        </label>
-        <label className="field">
-          <span>Merge follow-ups before auto-answer (ms)</span>
-          <input
-            type="number"
-            step="100"
-            min="0"
-            max="5000"
-            value={draft.interaction.mergeFollowUpsMs}
-            onChange={(e) => {
-              const next = Math.round(Number(e.target.value))
-              setInteraction(
-                'mergeFollowUpsMs',
-                Number.isFinite(next) ? Math.min(5000, Math.max(0, next)) : 2000
-              )
-            }}
-          />
-        </label>
-        <p className="hint small">
-          Wait before auto-answering so follow-up speech merges into one question. 0 = answer
-          immediately.
-        </p>
-        <label className="field">
-          <span>Silence split (ms)</span>
-          <input
-            type="number"
-            step="50"
-            min="600"
-            max="1500"
-            value={draft.interaction.silenceSplitMs}
-            onChange={(e) => {
-              const next = Math.round(Number(e.target.value))
-              setInteraction(
-                'silenceSplitMs',
-                Number.isFinite(next) ? Math.min(1500, Math.max(600, next)) : 900
-              )
-            }}
-          />
-        </label>
-        <p className="hint small">
-          How much silence splits an utterance (lower merges short pauses; applies the next time
-          you press Start).
-        </p>
-
-        <div className="row gap">
-          <button className="btn primary" onClick={() => void onSave(draft)}>
-            Save
-          </button>
-          <button className="btn" onClick={onBack}>
-            Back
-          </button>
-          <button className="btn ghost danger" onClick={onClear}>
-            Clear transcript
-          </button>
-        </div>
-      </div>
-    </div>
-  )
-}

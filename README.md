@@ -92,6 +92,8 @@ If Electron's binary is missing (npm 11 blocks install scripts by default), run:
 node node_modules\electron\install.js
 ```
 
+Tests: `npm test` runs the suite once, `npm test:watch` watches; `npm run typecheck` checks strict TS.
+
 ## Session context
 
 The home screen stores the company, job description, extra instructions, background, résumé and a

@@ -24,26 +24,36 @@ import {
   writeFileSync,
   promises as fsPromises
 } from 'node:fs'
-import { lookup } from 'node:dns/promises'
-import { BlockList } from 'node:net'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { autoUpdater } from 'electron-updater'
-import { MODEL_CATALOG } from '../shared/types'
-import {
-  parseStructuredAnswerText,
-  structuredAnswerMarkdown
-} from '../shared/structuredAnswer'
+import { buildSessionMarkdown } from '../shared/session-export'
 import type {
   AppConfig,
   CaptureTestCheck,
   CaptureTestReport,
-  ChatRequest,
-  LlmConfig,
-  ModelProfile
+  ChatRequest
 } from '../shared/types'
+import {
+  activeProfile,
+  buildChatMessages,
+  chatBody,
+  clampAnswerCooldown,
+  coerceWindowBounds,
+  normalizeAnswer,
+  normalizeLlm
+} from './llm-body'
+import { isAlwaysOnApp, isAlwaysOnTitle, meetingTitleHit } from './meeting-detect'
+import { assertPublicHost, normalizeHost, stripHtml } from './ssrf'
 
 const execFileAsync = promisify(execFile)
+
+// Interview content must stay out of stdout unless explicitly opted in.
+const PC_VERBOSE = process.env['PC_VERBOSE'] === '1'
+const CONTENT_LOG_RE = /^\[(segment|partial|answer-anchor|llm-answer|early-answer)/
+function verboseLog(...args: unknown[]): void {
+  if (PC_VERBOSE) console.log(...args)
+}
 
 // Overlay painting fix: Chromium otherwise skips painting occluded windows.
 app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion')
@@ -143,6 +153,8 @@ let alwaysOnNotified = false
 // Renderer-reported capture state; balloons are suppressed while listening.
 let rendererListening = false
 let updateTimer: ReturnType<typeof setInterval> | null = null
+// Set when an enabled feed is not https; surfaced by updates:check.
+let updateFeedError: string | null = null
 // Set when config.json failed to parse and was renamed aside (surfaced once).
 let corruptConfigBackupPath: string | null = null
 
@@ -163,32 +175,6 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
 function errorText(err: unknown, max = 160): string {
   const text = err instanceof Error ? err.message : String(err)
   return text.length > max ? text.slice(-max) : text
-}
-
-function clampTemperature(value: number): number {
-  return Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : 0.2
-}
-
-function clampMaxTokens(value: number): number {
-  return Number.isFinite(value) ? Math.min(8192, Math.max(128, Math.round(value))) : 4096
-}
-
-// Never send 'minimal' (errors on current Flash models) or 'none' (unsupported on Gemini 3.x/4.x).
-function clampReasoningEffort(
-  value: AppConfig['llm']['reasoningEffort']
-): 'low' | 'medium' | 'high' {
-  return value === 'medium' || value === 'high' ? value : 'low'
-}
-
-const ANSWER_COOLDOWN_MIN_MS = 1000
-const ANSWER_COOLDOWN_MAX_MS = 30_000
-const ANSWER_COOLDOWN_DEFAULT_MS = 5000
-
-// A hand-edited/out-of-range cooldown would hammer the LLM endpoint (or stall
-// auto-answer); the settings input uses the same 1000–30000 bounds.
-function clampAnswerCooldown(value: unknown): number {
-  if (typeof value !== 'number' || !Number.isFinite(value)) return ANSWER_COOLDOWN_DEFAULT_MS
-  return Math.min(ANSWER_COOLDOWN_MAX_MS, Math.max(ANSWER_COOLDOWN_MIN_MS, Math.round(value)))
 }
 
 // 0 disables the coalescing grace window (legacy immediate auto-answer).
@@ -216,174 +202,9 @@ function normalizeInteraction(
   }
 }
 
-// Hand-edited window bounds may be strings or garbage; setBounds() throws on a
-// non-finite value, so persist only real numbers (null = use the default size).
-function coerceWindowBounds(raw: unknown): AppConfig['window'] {
-  const base = DEFAULT_CONFIG.window
-  if (!isPlainObject(raw)) return { ...base }
-  const num = (value: unknown): number | null => {
-    if (typeof value === 'string' && value.trim() === '') return null
-    const parsed = typeof value === 'number' ? value : Number(value)
-    return Number.isFinite(parsed) ? parsed : null
-  }
-  return {
-    screenMode: raw.screenMode === 'cursor' ? 'cursor' : 'primary',
-    x: num(raw.x),
-    y: num(raw.y),
-    width: num(raw.width),
-    height: num(raw.height)
-  }
-}
-
 // Deliberately narrow: false negatives are fine, false positives cost latency.
 const CODE_RE =
   /\b(algorithm|complexity|time complexity|optimi[sz]e|dynamic programming|data structure|binary search|recursion|two pointers|sliding window)\b/i
-
-// --- Model profiles -------------------------------------------------------
-
-// Pre-v1.2 configs had one flat model config; wrap it so nothing is lost.
-function legacyProfile(llm: LlmConfig): ModelProfile {
-  return {
-    id: 'default',
-    label: 'My model',
-    badge: 'recommended',
-    baseUrl: typeof llm.baseUrl === 'string' ? llm.baseUrl : '',
-    apiKey: typeof llm.apiKey === 'string' ? llm.apiKey : '',
-    model: typeof llm.model === 'string' ? llm.model : '',
-    temperature:
-      typeof llm.temperature === 'number' && Number.isFinite(llm.temperature)
-        ? llm.temperature
-        : null,
-    maxTokens:
-      typeof llm.maxTokens === 'number' && Number.isFinite(llm.maxTokens) ? llm.maxTokens : null,
-    effort:
-      llm.reasoningEffort === 'medium' || llm.reasoningEffort === 'high'
-        ? llm.reasoningEffort
-        : 'low',
-    escalateOnCode: llm.autoEscalate === true
-  }
-}
-
-// Config files are user-editable JSON, so coerce each persisted profile instead
-// of trusting its shape.
-function coerceProfile(raw: unknown, index: number, fallback: ModelProfile): ModelProfile {
-  if (!isPlainObject(raw)) return { ...fallback, id: `profile-${index}` }
-  const str = (value: unknown, def: string): string => (typeof value === 'string' ? value : def)
-  const num = (value: unknown): number | null =>
-    typeof value === 'number' && Number.isFinite(value) ? value : null
-  const effort = raw.effort
-  const badge = raw.badge
-  return {
-    id: str(raw.id, `profile-${index}`),
-    label: str(raw.label, `Model ${index + 1}`),
-    badge:
-      badge === 'fast' || badge === 'slow' || badge === 'very-slow' ? badge : 'recommended',
-    baseUrl: str(raw.baseUrl, fallback.baseUrl),
-    apiKey: str(raw.apiKey, ''),
-    model: str(raw.model, fallback.model),
-    temperature: num(raw.temperature),
-    maxTokens: num(raw.maxTokens),
-    effort: effort === 'low' || effort === 'medium' || effort === 'high' ? effort : 'default',
-    escalateOnCode: raw.escalateOnCode === true
-  }
-}
-
-// Guarantees at least one profile and a valid active id, even from a hand-edited
-// or partially migrated config.
-function normalizeLlm(llm: LlmConfig): LlmConfig {
-  if (!isPlainObject(llm)) return normalizeLlm(DEFAULT_CONFIG.llm)
-  const legacy = legacyProfile(llm)
-  const rawProfiles = Array.isArray(llm.profiles) ? llm.profiles : []
-  const profiles = rawProfiles.map((profile, index) => coerceProfile(profile, index, legacy))
-  if (profiles.length === 0) profiles.push(legacy)
-  const seen = new Set<string>()
-  for (const profile of profiles) {
-    if (seen.has(profile.id)) {
-      // Skip ids that already exist too (e.g. ["a", "a-2", "a"]).
-      let n = 1
-      let candidate = `${profile.id}-${n}`
-      while (seen.has(candidate)) candidate = `${profile.id}-${++n}`
-      profile.id = candidate
-    }
-    seen.add(profile.id)
-  }
-  const activeProfileId = profiles.some((profile) => profile.id === llm.activeProfileId)
-    ? llm.activeProfileId
-    : profiles[0].id
-  return { ...llm, profiles, activeProfileId }
-}
-
-const QUESTION_TYPES = new Set([
-  'auto',
-  'behavioral',
-  'coding',
-  'system-design',
-  'experience',
-  'technical',
-  'other'
-])
-
-function normalizeAnswer(answer: AppConfig['answer']): AppConfig['answer'] {
-  if (!isPlainObject(answer)) return { ...DEFAULT_CONFIG.answer }
-  return QUESTION_TYPES.has(answer.questionType as string)
-    ? answer
-    : { ...answer, questionType: 'auto' }
-}
-
-function activeProfile(llm: LlmConfig): ModelProfile {
-  return (
-    llm.profiles.find((profile) => profile.id === llm.activeProfileId) ??
-    llm.profiles[0] ??
-    legacyProfile(llm)
-  )
-}
-
-interface VendorRules {
-  temperature: boolean
-  effort: boolean
-}
-
-// The catalog is the single source of vendor quirks. Unknown/custom models stay
-// permissive unless they point at Anthropic's endpoint, where Claude 5.x still
-// rejects temperature and ignores reasoning_effort.
-function vendorRulesFor(profile: ModelProfile): VendorRules {
-  const entry = MODEL_CATALOG.find((item) => item.model === profile.model)
-  if (profile.baseUrl.toLowerCase().includes('anthropic.com') || entry?.vendor === 'anthropic') {
-    return { temperature: false, effort: false }
-  }
-  return {
-    temperature: entry ? entry.supportsTemperature : true,
-    effort: entry ? entry.supportsEffort : true
-  }
-}
-
-// Escalation only ever raises low → high, and never when effort is omitted.
-function effectiveEffort(profile: ModelProfile, escalate: boolean): 'low' | 'medium' | 'high' | null {
-  if (profile.effort === 'default') return null
-  const configured = clampReasoningEffort(profile.effort)
-  return escalate && configured === 'low' ? 'high' : configured
-}
-
-function chatBody(
-  profile: ModelProfile,
-  messages: unknown[],
-  opts: { stream: boolean; escalate: boolean }
-): Record<string, unknown> {
-  const rules = vendorRulesFor(profile)
-  const body: Record<string, unknown> = {
-    model: profile.model,
-    stream: opts.stream,
-    messages
-  }
-  // null means "let the vendor choose" — omit the key instead of picking one.
-  if (profile.temperature != null && rules.temperature) {
-    body.temperature = clampTemperature(profile.temperature)
-  }
-  if (profile.maxTokens != null) body.max_tokens = clampMaxTokens(profile.maxTokens)
-  const effort = effectiveEffort(profile, opts.escalate)
-  if (effort && rules.effort) body.reasoning_effort = effort
-  return body
-}
 
 // Prevents a stalled stream from latching streaming.current until app restart.
 const STREAM_IDLE_TIMEOUT_MS = 20_000
@@ -452,10 +273,10 @@ function loadConfig(): AppConfig {
     const merged = deepMerge(DEFAULT_CONFIG, JSON.parse(raw))
     return {
       ...merged,
-      llm: normalizeLlm(merged.llm),
-      answer: normalizeAnswer(merged.answer),
+      llm: normalizeLlm(merged.llm, DEFAULT_CONFIG.llm),
+      answer: normalizeAnswer(merged.answer, DEFAULT_CONFIG.answer),
       interaction: normalizeInteraction(merged.interaction),
-      window: coerceWindowBounds(merged.window)
+      window: coerceWindowBounds(merged.window, DEFAULT_CONFIG.window)
     }
   } catch {
     if (existsSync(configPath())) {
@@ -470,10 +291,10 @@ function loadConfig(): AppConfig {
     }
     return {
       ...DEFAULT_CONFIG,
-      llm: normalizeLlm(DEFAULT_CONFIG.llm),
-      answer: normalizeAnswer(DEFAULT_CONFIG.answer),
+      llm: normalizeLlm(DEFAULT_CONFIG.llm, DEFAULT_CONFIG.llm),
+      answer: normalizeAnswer(DEFAULT_CONFIG.answer, DEFAULT_CONFIG.answer),
       interaction: normalizeInteraction(DEFAULT_CONFIG.interaction),
-      window: coerceWindowBounds(DEFAULT_CONFIG.window)
+      window: coerceWindowBounds(DEFAULT_CONFIG.window, DEFAULT_CONFIG.window)
     }
   }
 }
@@ -818,7 +639,10 @@ function createWindow(): void {
 
   win.webContents.on('console-message', (event) => {
     const details = event as unknown as { message?: string; level?: string | number }
-    console.log('[renderer]', details.message ?? '')
+    const message = details.message ?? ''
+    // Transcript/question/answer content is gated; status logs still flow.
+    if (!PC_VERBOSE && CONTENT_LOG_RE.test(message)) return
+    console.log('[renderer]', message)
   })
 
   win.on('closed', () => {
@@ -1053,7 +877,6 @@ const PDF_LEGACY_MODULE: string = 'pdfjs-dist/legacy/build/pdf.mjs'
 const MAX_PDF_CHARS = 30_000
 const MAX_JOB_CHARS = 10_000
 const MAX_JOB_HTML = 500_000
-const MAX_JOB_STRIP_INPUT = 150_000
 
 async function extractPdfText(
   filePath: string
@@ -1130,221 +953,6 @@ function runPdfTestHook(): void {
       const message = err instanceof Error ? err.message : String(err)
       console.log(`[pdf-test] ${JSON.stringify({ ok: false, error: message.slice(0, 120) })}`)
     })
-}
-
-const BLOCKED_IPV6 = new BlockList()
-BLOCKED_IPV6.addAddress('::', 'ipv6')
-BLOCKED_IPV6.addAddress('::1', 'ipv6')
-BLOCKED_IPV6.addSubnet('fe80::', 10, 'ipv6')
-BLOCKED_IPV6.addSubnet('fd00::', 8, 'ipv6')
-
-function normalizeHost(hostname: string): string {
-  const host = hostname.toLowerCase()
-  return host.endsWith('.') ? host.slice(0, -1) : host
-}
-
-// Strict dotted quad only: rejects octal/decimal/shorthand IPv4 literals.
-function parseDottedQuad(host: string): number[] | null {
-  const parts = host.split('.')
-  if (parts.length !== 4) return null
-  const octets: number[] = []
-  for (const part of parts) {
-    if (!/^(0|[1-9]\d{0,2})$/.test(part)) return null
-    const value = Number(part)
-    if (value > 255) return null
-    octets.push(value)
-  }
-  return octets
-}
-
-function isPrivateIpv4(octets: number[]): boolean {
-  const [a, b] = octets
-  return (
-    a === 0 ||
-    a === 10 ||
-    a === 127 ||
-    (a === 169 && b === 254) ||
-    (a === 172 && b >= 16 && b <= 31) ||
-    (a === 192 && b === 168)
-  )
-}
-
-// URL parsing canonicalizes IPv6 (compressed + lowercase), which also catches
-// mapped addresses written in expanded form.
-function canonicalIpv6(address: string): string {
-  const bare = address.toLowerCase().replace(/^\[|\]$/g, '').split('%')[0]
-  try {
-    return new URL(`http://[${bare}]/`).hostname.replace(/^\[|\]$/g, '')
-  } catch {
-    return bare
-  }
-}
-
-// ::ffff:0:0/96 — compare the embedded low 32 bits against the IPv4 ranges.
-function mappedIpv4(address: string): number[] | null {
-  const host = canonicalIpv6(address)
-  if (!host.startsWith('::ffff:')) return null
-  const tail = host.slice('::ffff:'.length)
-  if (tail.includes('.')) return parseDottedQuad(tail)
-  const groups = tail.split(':')
-  if (groups.length !== 2) return null
-  const hi = Number.parseInt(groups[0], 16)
-  const lo = Number.parseInt(groups[1], 16)
-  if (!Number.isInteger(hi) || !Number.isInteger(lo)) return null
-  return [(hi >> 8) & 0xff, hi & 0xff, (lo >> 8) & 0xff, lo & 0xff]
-}
-
-function isBlockedIpv6(address: string): boolean {
-  const mapped = mappedIpv4(address)
-  if (mapped) return isPrivateIpv4(mapped)
-  return BLOCKED_IPV6.check(canonicalIpv6(address), 'ipv6')
-}
-
-function isBlockedHost(hostname: string): boolean {
-  const host = normalizeHost(hostname)
-  if (host === 'localhost' || host.endsWith('.local')) return true
-  if (/^[0-9.]+$/.test(host)) {
-    // Anything numeric must be a strict public dotted quad; this blocks
-    // 2130706433, 127.1 and 0177.0.0.1 before any resolver sees them.
-    const quad = parseDottedQuad(host)
-    return quad === null || isPrivateIpv4(quad)
-  }
-  if (host.includes(':')) return isBlockedIpv6(host)
-  return false
-}
-
-async function assertPublicHost(hostname: string): Promise<void> {
-  const host = normalizeHost(hostname)
-  if (isBlockedHost(host)) throw new Error('Local/private URLs are not supported')
-  const lookupHost = host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host
-  let addresses: Array<{ address: string; family: number }>
-  try {
-    addresses = await lookup(lookupHost, { all: true })
-  } catch {
-    throw new Error('Could not resolve host')
-  }
-  for (const entry of addresses) {
-    if (entry.family === 4) {
-      const octets = parseDottedQuad(entry.address)
-      if (!octets || isPrivateIpv4(octets)) {
-        throw new Error('Local/private URLs are not supported')
-      }
-    } else if (isBlockedIpv6(entry.address)) {
-      throw new Error('Local/private URLs are not supported')
-    }
-  }
-}
-
-function decodeCodePoint(value: number): string {
-  if (!Number.isInteger(value) || value < 0 || value > 0x10ffff) return ''
-  if (value >= 0xd800 && value <= 0xdfff) return ''
-  return String.fromCodePoint(value)
-}
-
-function decodeHtml(text: string): string {
-  // &amp; is decoded last so a literal "&amp;lt;" stays "&lt;".
-  return text
-    .replace(/&#x([0-9a-f]+);/gi, (_match, hex: string) =>
-      decodeCodePoint(Number.parseInt(hex, 16))
-    )
-    .replace(/&#(\d+);/g, (_match, dec: string) => decodeCodePoint(Number(dec)))
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
-    .replace(/&quot;/gi, '"')
-    .replace(/&apos;/gi, "'")
-    .replace(/&amp;/gi, '&')
-}
-
-// ASCII-only lowercasing keeps indices aligned with the original string.
-function asciiLower(text: string): string {
-  return text.replace(/[A-Z]/g, (char) => char.toLowerCase())
-}
-
-function isTagNameChar(code: number): boolean {
-  return (
-    (code >= 48 && code <= 57) || // 0-9
-    (code >= 65 && code <= 90) || // A-Z
-    (code >= 97 && code <= 122) // a-z
-  )
-}
-
-// Single-pass tag tokenizer: no regex over the whole document. Script/style
-// bodies are skipped wholesale; <title> and og:title are captured separately.
-function stripHtml(html: string): { text: string; title: string } {
-  const source = html.slice(0, MAX_JOB_STRIP_INPUT)
-  const lower = asciiLower(source)
-  let out = ''
-  let docTitle = ''
-  let ogTitle = ''
-  let i = 0
-
-  while (i < source.length) {
-    const lt = source.indexOf('<', i)
-    if (lt < 0) {
-      out += source.slice(i)
-      break
-    }
-    out += source.slice(i, lt)
-
-    if (lower.startsWith('<!--', lt)) {
-      const end = lower.indexOf('-->', lt + 4)
-      if (end < 0) break
-      out += ' '
-      i = end + 3
-      continue
-    }
-
-    const gt = source.indexOf('>', lt + 1)
-    if (gt < 0) break
-
-    let p = lt + 1
-    const closing = source[p] === '/'
-    if (closing) p++
-    const nameStart = p
-    while (p < source.length && isTagNameChar(source.charCodeAt(p))) p++
-    const name = lower.slice(nameStart, p)
-
-    if (!closing && (name === 'script' || name === 'style')) {
-      const close = lower.indexOf(`</${name}`, gt + 1)
-      if (close < 0) break
-      const closeGt = source.indexOf('>', close)
-      if (closeGt < 0) break
-      out += ' '
-      i = closeGt + 1
-      continue
-    }
-
-    if (!closing && name === 'title') {
-      const close = lower.indexOf('</title', gt + 1)
-      if (close < 0) {
-        i = gt + 1
-        continue
-      }
-      if (!docTitle) docTitle = source.slice(gt + 1, close)
-      const closeGt = source.indexOf('>', close)
-      if (closeGt < 0) break
-      out += ' '
-      i = closeGt + 1
-      continue
-    }
-
-    if (!closing && name === 'meta' && !ogTitle) {
-      const tag = source.slice(lt, gt + 1)
-      if (/(?:property|name)\s*=\s*["']?og:title\b/i.test(tag)) {
-        const content = /(?:^|\s)content\s*=\s*("([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(tag)
-        ogTitle = content?.[2] ?? content?.[3] ?? content?.[4] ?? ''
-      }
-    }
-
-    out += ' '
-    i = gt + 1
-  }
-
-  return {
-    title: decodeHtml((ogTitle || docTitle).replace(/\s+/g, ' ').trim()).slice(0, 200),
-    text: decodeHtml(out).replace(/\s+/g, ' ').trim()
-  }
 }
 
 async function readBodyBounded(
@@ -1453,8 +1061,8 @@ function registerIpc(): void {
     const merged = deepMerge(config, patch)
     config = {
       ...merged,
-      llm: normalizeLlm(merged.llm),
-      answer: normalizeAnswer(merged.answer),
+      llm: normalizeLlm(merged.llm, DEFAULT_CONFIG.llm),
+      answer: normalizeAnswer(merged.answer, DEFAULT_CONFIG.answer),
       interaction: normalizeInteraction(merged.interaction)
     }
     persistConfig()
@@ -1799,46 +1407,8 @@ function registerIpc(): void {
       segments?: Array<{ id?: string; speaker?: string; text?: string }>
       answers?: Array<{ text?: string; error?: string; question?: string; anchorId?: string }>
     }
-    const answersByAnchor = new Map<string, string[]>()
-    const loose: string[] = []
-    for (const answer of data.answers ?? []) {
-      const body = (answer.text || answer.error || '').trim()
-      if (!body) continue
-      const fallback = body
-        .split('\n')
-        .map((line) => `> ${line}`)
-        .join('\n')
-      const rendered = answer.error
-        ? fallback
-        : structuredAnswerMarkdown(parseStructuredAnswerText(answer.text ?? ''), fallback)
-      if (answer.anchorId) {
-        const list = answersByAnchor.get(answer.anchorId) ?? []
-        list.push(rendered)
-        answersByAnchor.set(answer.anchorId, list)
-      } else {
-        loose.push(rendered)
-      }
-    }
-    const lines: string[] = [`# ${data.title?.trim() || 'Session'}`, '']
-    for (const segment of data.segments ?? []) {
-      const speaker = segment.speaker === 'You' ? 'You' : 'Them'
-      lines.push(`**${speaker}:** ${(segment.text ?? '').trim()}`, '')
-      if (segment.id) {
-        for (const quote of answersByAnchor.get(segment.id) ?? []) lines.push(quote, '')
-        answersByAnchor.delete(segment.id)
-      }
-    }
-    for (const list of answersByAnchor.values()) {
-      for (const quote of list) lines.push(quote, '')
-    }
-    for (const quote of loose) lines.push(quote, '')
-    lines.push(
-      '---',
-      `Exported from Parakeet Clone — ${data.endedAt ?? new Date().toISOString()}`,
-      ''
-    )
     const outPath = join(dir, `${name.replace(/\.json$/i, '')}.md`)
-    writeFileSync(outPath, lines.join('\n'), 'utf8')
+    writeFileSync(outPath, buildSessionMarkdown(data), 'utf8')
     return outPath
   })
 
@@ -1889,6 +1459,9 @@ function registerIpc(): void {
   })
 
   ipcMain.handle('updates:check', async () => {
+    if (updateFeedError) {
+      return { ok: false, error: updateFeedError }
+    }
     if (!config.updates.enabled || !config.updates.feedUrl) {
       return { ok: false, error: 'Updates not configured' }
     }
@@ -1918,18 +1491,16 @@ function registerIpc(): void {
     const headers: Record<string, string> = { 'Content-Type': 'application/json' }
     if (profile.apiKey) headers['Authorization'] = `Bearer ${profile.apiKey}`
 
+    // The renderer always sends [system, ...assistant turns, user]. `last` is
+    // captured before assembly because the multimodal form replaces that turn.
     const last = req.messages[req.messages.length - 1]
-    const messages = [...req.messages]
-    if (req.vision && req.images.length > 0 && last) {
-      // Multimodal form: latest user turn carries image parts.
-      messages[messages.length - 1] = {
-        role: 'user',
-        content: [
-          { type: 'text', text: last.content },
-          ...req.images.map((url) => ({ type: 'image_url', image_url: { url } }))
-        ] as unknown as string
-      }
-    }
+    const messages = buildChatMessages({
+      systemPrompt: req.messages[0]?.content ?? '',
+      priorTurns: req.messages.slice(1, req.messages.length - 1),
+      question: last?.content,
+      images: req.images,
+      vision: req.vision
+    })
 
     // Auto-escalate only from 'low'; the regex is intentionally narrow.
     // An explicit coding question type acts as escalateOnCode for this ask.
@@ -2016,7 +1587,7 @@ function registerIpc(): void {
       }
       clearStreamIdleTimer()
       event.sender.send('llm:done', { id: req.id })
-      console.log(`[llm-answer] ${full}`)
+      verboseLog(`[llm-answer] ${full}`)
       return { ok: true, text: full }
     } catch (err) {
       const connectTimedOut = connectCtrl.signal.aborted && !ctrl.signal.aborted
@@ -2188,35 +1759,6 @@ const MEETING_APPS = [
   'whatsapp.exe'
 ]
 
-// Apps that are commonly always running: notify, but never auto-start capture.
-const ALWAYS_ON_APPS = ['discord.exe', 'slack.exe', 'whatsapp.exe']
-
-// Browser meetings have no process signature, so match app-shaped window titles.
-// `strong` titles are meeting-specific enough to auto-start capture; generic
-// titles ("Meet - abc", "FaceTime") only notify, since a browser tab or the
-// FaceTime app can sit open all day.
-const MEETING_TITLE_RE: Array<{ re: RegExp; strong: boolean }> = [
-  { re: / - zoom( meeting)?$/i, strong: false }, // "... - Zoom" / "... - Zoom Meeting"
-  {
-    re: /(^| - )zoom meeting( - (google chrome|microsoft edge)| — (google chrome|microsoft edge))?$/i,
-    strong: false
-  }, // "Zoom Meeting" / "Zoom Meeting - Google Chrome" / "Zoom Meeting — Microsoft Edge"
-  // The em-dash in Edge window separators is intentional (TS source is UTF-8;
-  // only the .ps1 scripts must stay ASCII).
-  // Browser-suffixed Meet titles only; non-browser "Meet - <name>" titles rely
-  // on the generic pattern below and are notify-only.
-  {
-    re: /^meet(\.google\.com)?(?: - \S+| — \S+)?(?: - google chrome| — microsoft edge)$/i,
-    strong: true
-  }, // "Meet - abc - Google Chrome" / "meet.google.com — Microsoft Edge"
-  { re: /^meet - .+$/i, strong: false }, // "Meet - abc-def"
-  { re: /( - |^)microsoft teams( meeting.*)?$/i, strong: true }, // "Microsoft Teams Meeting" / "... - Microsoft Teams"
-  { re: / - webex meeting( \|.*)?$/i, strong: false }, // "... - Webex Meeting | ..."
-  { re: /facetime$/i, strong: false }, // "FaceTime"
-  { re: / - discord$/i, strong: false }, // "... - Discord"
-  { re: /zoom workplace/i, strong: true } // "Zoom Workplace"
-]
-
 async function listMeetingTitles(): Promise<string[]> {
   try {
     const sources = await desktopCapturer.getSources({
@@ -2228,18 +1770,6 @@ async function listMeetingTitles(): Promise<string[]> {
   } catch {
     return []
   }
-}
-
-function meetingTitleHit(titles: string[]): { title: string; strong: boolean } | null {
-  let hit: { title: string; strong: boolean } | null = null
-  for (const title of titles) {
-    for (const pattern of MEETING_TITLE_RE) {
-      if (!pattern.re.test(title)) continue
-      if (!hit) hit = { title, strong: pattern.strong }
-      else if (pattern.strong) hit.strong = true
-    }
-  }
-  return hit
 }
 
 async function listProcessNames(): Promise<string[]> {
@@ -2267,11 +1797,9 @@ async function pollMeeting(): Promise<void> {
     const [names, titles] = await Promise.all([listProcessNames(), listMeetingTitles()])
     const processHits = names.filter((name) => MEETING_APPS.includes(name))
     const titleHit = meetingTitleHit(titles)
-    const titleAlwaysOn = titleHit
-      ? /\b(discord|slack|whatsapp)\b/i.test(titleHit.title)
-      : false
+    const titleAlwaysOn = titleHit ? isAlwaysOnTitle(titleHit.title) : false
     const hits = [
-      ...processHits.map((name) => ({ label: name, alwaysOn: ALWAYS_ON_APPS.includes(name) })),
+      ...processHits.map((name) => ({ label: name, alwaysOn: isAlwaysOnApp(name) })),
       ...(titleHit ? [{ label: titleHit.title, alwaysOn: titleAlwaysOn }] : [])
     ]
     const nonAlwaysOn = hits.filter((hit) => !hit.alwaysOn)
@@ -2279,7 +1807,7 @@ async function pollMeeting(): Promise<void> {
     // browser/Teams/Zoom title; generic "Meet - X" / "FaceTime" titles only
     // notify, since they can be an idle tab or app.
     const autoStartEligible =
-      processHits.some((name) => !ALWAYS_ON_APPS.includes(name)) || titleHit?.strong === true
+      processHits.some((name) => !isAlwaysOnApp(name)) || titleHit?.strong === true
     // Slack all day + a meeting starting at 2pm must still auto-start: the latch
     // tracks the non-always-on signature, not just "something is active".
     const sig = nonAlwaysOn
@@ -2361,11 +1889,31 @@ function setupUpdates(): void {
     clearInterval(updateTimer)
     updateTimer = null
   }
-  if (!config.updates.enabled || !config.updates.feedUrl) return
+  if (!config.updates.enabled || !config.updates.feedUrl) {
+    updateFeedError = null
+    return
+  }
+  // Unsigned updates over plain http are the last unguarded link in the update
+  // chain; refuse to configure the updater for anything but https.
+  let feed: URL
+  try {
+    feed = new URL(config.updates.feedUrl)
+  } catch {
+    updateFeedError = 'Feed URL must be https://...'
+    console.warn('[updates] refusing to configure updater:', updateFeedError)
+    return
+  }
+  if (feed.protocol !== 'https:') {
+    updateFeedError = 'Feed URL must be https://...'
+    console.warn('[updates] refusing to configure updater:', updateFeedError)
+    return
+  }
+  updateFeedError = null
   try {
     autoUpdater.setFeedURL({ provider: 'generic', url: config.updates.feedUrl })
   } catch (err) {
     console.error('Invalid update feed', err)
+    updateFeedError = 'Invalid update feed URL'
     return
   }
   autoUpdater.autoDownload = true
@@ -2436,6 +1984,19 @@ if (!gotSingleInstanceLock) {
     config = loadConfig()
     const redacted = {
       ...config,
+      // Content gating: interview material never goes to stdout. Lengths (and
+      // the title/company fields) still prove the config loaded and is shaped
+      // correctly without printing résumé, background, JD or extra context.
+      profile: {
+        resume: `<${config.profile.resume.length} chars>`,
+        background: `<${config.profile.background.length} chars>`,
+        vocabulary: `<${config.profile.vocabulary.length} chars>`
+      },
+      session: {
+        ...config.session,
+        jobDescription: `<${config.session.jobDescription.length} chars>`,
+        extraContext: `<${config.session.extraContext.length} chars>`
+      },
       llm: {
         ...config.llm,
         apiKey: config.llm.apiKey ? '***' : '',
