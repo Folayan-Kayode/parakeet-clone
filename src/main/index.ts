@@ -2387,12 +2387,18 @@ function registerDisplayMedia(): void {
     { useSystemPicker: false }
   )
 
-  // Only the media permission is needed: getUserMedia for the optional "You"
-  // channel and getDisplayMedia for loopback system audio. clipboard-sanitized-
-  // write covers the Copy buttons without granting clipboard reads. Deny
-  // everything else rather than blanket-granting every Electron permission.
+  // Only these permissions are needed: 'media' covers getUserMedia for the
+  // optional "You" channel, 'display-capture' covers getDisplayMedia/loopback
+  // capture (a distinct Chromium permission type in Electron), and
+  // 'clipboard-sanitized-write' covers the Copy buttons without granting
+  // clipboard reads. Deny everything else rather than blanket-granting every
+  // Electron permission.
   session.defaultSession.setPermissionRequestHandler((_wc, permission, cb) =>
-    cb(permission === 'media' || permission === 'clipboard-sanitized-write')
+    cb(
+      permission === 'media' ||
+        permission === 'display-capture' ||
+        permission === 'clipboard-sanitized-write'
+    )
   )
 }
 
