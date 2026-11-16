@@ -132,6 +132,10 @@ export interface AsrConfig {
 export interface InteractionConfig {
   autoAnswer: boolean
   answerCooldownMs: number
+  /** Grace window before final-triggered auto-answers; 0 = ask immediately. */
+  mergeFollowUpsMs: number
+  /** Silence that ends an utterance (AudioEngine VAD). */
+  silenceSplitMs: number
   transcribeMic: boolean
   streamingPartials: boolean
   earlyAnswer: boolean

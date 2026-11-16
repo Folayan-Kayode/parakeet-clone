@@ -34,6 +34,20 @@ interface Segment {
   partial?: boolean
 }
 
+interface ThemPcmChunk {
+  uid: number
+  pcm: Uint8Array
+  at: number
+}
+
+interface CoalesceHold {
+  question: string
+  anchorUid: number
+  uids: number[]
+  timer: number
+  firing: boolean
+}
+
 interface Answer {
   id: string
   text: string
@@ -52,6 +66,38 @@ interface Answer {
 function clip(text: string, max: number): string {
   const t = text.trim()
   return t.length > max ? `${t.slice(0, max)}…` : t
+}
+
+// Wrap concatenated 16 kHz mono 16-bit PCM blocks in a fresh WAV header.
+// Header math: RIFF size = 36 + data, byte rate = 16000 * 1 * 2, block align = 2.
+function encodePcmWav(blocks: Uint8Array[]): ArrayBuffer {
+  let dataLength = 0
+  for (const block of blocks) dataLength += block.length
+  const buffer = new ArrayBuffer(44 + dataLength)
+  const view = new DataView(buffer)
+  const writeStr = (offset: number, value: string): void => {
+    for (let i = 0; i < value.length; i++) view.setUint8(offset + i, value.charCodeAt(i))
+  }
+  writeStr(0, 'RIFF')
+  view.setUint32(4, 36 + dataLength, true)
+  writeStr(8, 'WAVE')
+  writeStr(12, 'fmt ')
+  view.setUint32(16, 16, true)
+  view.setUint16(20, 1, true)
+  view.setUint16(22, 1, true)
+  view.setUint32(24, 16000, true)
+  view.setUint32(28, 32000, true)
+  view.setUint16(32, 2, true)
+  view.setUint16(34, 16, true)
+  writeStr(36, 'data')
+  view.setUint32(40, dataLength, true)
+  const bytes = new Uint8Array(buffer)
+  let offset = 44
+  for (const block of blocks) {
+    bytes.set(block, offset)
+    offset += block.length
+  }
+  return buffer
 }
 
 const QUESTION_TYPE_LABELS: Record<QuestionType, string> = {
@@ -688,6 +734,8 @@ export default function App() {
   const scrollRef = useRef<HTMLDivElement | null>(null)
   const atBottomRef = useRef(true)
   const queueTimer = useRef<number | null>(null)
+  const themPcm = useRef<ThemPcmChunk[]>([])
+  const coalesceRef = useRef<CoalesceHold | null>(null)
   const regionDrag = useRef<{ startX: number; startY: number; rect: DOMRect } | null>(null)
   const regionImgRef = useRef<HTMLImageElement | null>(null)
   const modelSwitchRef = useRef<HTMLDivElement | null>(null)
@@ -866,6 +914,10 @@ export default function App() {
       engines.current?.them?.stop()
       void window.api.setCaptureListening(false).catch(() => undefined)
       if (queueTimer.current) window.clearTimeout(queueTimer.current)
+      if (coalesceRef.current) {
+        window.clearTimeout(coalesceRef.current.timer)
+        coalesceRef.current = null
+      }
     }
   }, [])
 
@@ -912,6 +964,155 @@ export default function App() {
     [dispatchQueuedAsk]
   )
 
+  // Whisper initial_prompt: company + vocabulary first, then the recent
+  // transcript carry-over in the remaining budget.
+  // OpenAI whisper-1 prompt limit is 224 tokens; 700 chars is safe headroom.
+  const whisperPrompt = useCallback((speaker: Speaker): string => {
+    const carry = promptRef.current[speaker]
+    const cfg = configRef.current
+    const company = (cfg?.session.company ?? '').replace(/\s+/g, ' ').trim()
+    const vocabulary = (cfg?.profile.vocabulary ?? '').replace(/\s+/g, ' ').trim()
+    const prefix = [
+      company && `Company: ${company}.`,
+      vocabulary && `Terms: ${vocabulary}.`
+    ]
+      .filter(Boolean)
+      .join(' ')
+    if (!prefix) return carry
+    const budget = 700
+    const clipped = prefix.slice(0, budget)
+    const room = Math.max(0, budget - clipped.length - 1)
+    return `${clipped}${room > 0 && carry ? ` ${carry.slice(-room)}` : ''}`.slice(0, budget)
+  }, [])
+
+  // Keep the last four Them WAVs as headerless 16 kHz mono 16-bit PCM so a
+  // coalesced question can be re-transcribed from the full audio.
+  const rememberThemPcm = useCallback((uid: number, wav: ArrayBuffer) => {
+    if (wav.byteLength <= 44) return
+    const now = Date.now()
+    themPcm.current = [
+      ...themPcm.current.filter((item) => now - item.at <= 60_000 && item.uid !== uid),
+      { uid, pcm: new Uint8Array(wav.slice(44)), at: now }
+    ].slice(-4)
+  }, [])
+
+  const transcribeCoalesced = useCallback(
+    async (uids: number[]): Promise<string | null> => {
+      const blocks: Uint8Array[] = []
+      for (const uid of [...uids].sort((a, b) => a - b)) {
+        const entry = themPcm.current.find((item) => item.uid === uid)
+        if (!entry) return null
+        blocks.push(entry.pcm)
+      }
+      if (blocks.length === 0) return null
+      try {
+        const { text } = await window.api.transcribe(
+          encodePcmWav(blocks),
+          whisperPrompt('Them')
+        )
+        return text.trim() || null
+      } catch {
+        return null
+      }
+    },
+    [whisperPrompt]
+  )
+
+  const fireCoalesce = useCallback(async (): Promise<void> => {
+    const hold = coalesceRef.current
+    if (!hold) return
+    // Take ownership: kill any restarted timer, then freeze timer restarts while
+    // the re-transcription is in flight.
+    window.clearTimeout(hold.timer)
+    hold.firing = true
+    const uidCount = hold.uids.length
+    let question = hold.question
+    if (uidCount >= 2) {
+      const audioText = await transcribeCoalesced(hold.uids)
+      if (coalesceRef.current !== hold) return
+      if (hold.uids.length !== uidCount) {
+        // A continuation landed mid-transcription. Keep the hold and re-run the
+        // timer so the extended set is re-transcribed with all of its audio.
+        hold.firing = false
+        const mergeMs = configRef.current?.interaction.mergeFollowUpsMs ?? 2000
+        window.clearTimeout(hold.timer)
+        hold.timer = window.setTimeout(
+          () => void fireCoalesce(),
+          Math.max(600, Math.round(mergeMs * 0.6))
+        )
+        return
+      }
+      question = audioText ?? hold.question
+    }
+    if (coalesceRef.current !== hold) return
+    coalesceRef.current = null
+    const cfg = configRef.current
+    if (!cfg || !cfg.interaction.autoAnswer) return
+    const cooldownLeft = cfg.interaction.answerCooldownMs - (Date.now() - lastAnswerAt.current)
+    if (streaming.current || cooldownLeft > 0) {
+      queueAsk(question, hold.anchorUid)
+    } else {
+      askRef.current(question, hold.anchorUid)
+    }
+  }, [queueAsk, transcribeCoalesced])
+
+  const restartCoalesceTimer = useCallback(
+    (delayMs: number) => {
+      const hold = coalesceRef.current
+      if (!hold) return
+      window.clearTimeout(hold.timer)
+      hold.timer = window.setTimeout(() => void fireCoalesce(), delayMs)
+    },
+    [fireCoalesce]
+  )
+
+  const startCoalesce = useCallback(
+    (question: string, anchorUid: number, mergeMs: number) => {
+      const timer = window.setTimeout(() => void fireCoalesce(), mergeMs)
+      coalesceRef.current = { question, anchorUid, uids: [anchorUid], timer, firing: false }
+    },
+    [fireCoalesce]
+  )
+
+  const addCoalesceContinuation = useCallback(
+    (uid: number, text: string, mergeMs: number) => {
+      const hold = coalesceRef.current
+      if (!hold) return
+      if (!hold.uids.includes(uid)) hold.uids.push(uid)
+      hold.question = `${hold.question} ${text}`.trim()
+      // While a re-transcription is in flight, the fire path re-checks the uid
+      // count and restarts the timer itself.
+      if (!hold.firing) restartCoalesceTimer(Math.max(600, Math.round(mergeMs * 0.6)))
+    },
+    [restartCoalesceTimer]
+  )
+
+  const extendCoalesce = useCallback(() => {
+    // A partial means the final chunk is still coming; restart at the 600 ms
+    // minimum so a long hold cannot be pushed forward indefinitely.
+    const hold = coalesceRef.current
+    if (!hold || hold.firing) return
+    restartCoalesceTimer(600)
+  }, [restartCoalesceTimer])
+
+  const cancelCoalesce = useCallback(() => {
+    const hold = coalesceRef.current
+    if (!hold) return
+    window.clearTimeout(hold.timer)
+    coalesceRef.current = null
+  }, [])
+
+  const takeCoalesceForManualAsk = useCallback(async (): Promise<string | null> => {
+    const hold = coalesceRef.current
+    if (!hold) return null
+    cancelCoalesce()
+    if (hold.uids.length >= 2) {
+      const audioText = await transcribeCoalesced(hold.uids)
+      if (audioText) return audioText
+    }
+    return hold.question
+  }, [cancelCoalesce, transcribeCoalesced])
+
   const appendSegment = useCallback(
     (speaker: Speaker, text: string, partialId?: string, utteranceId = -1) => {
       const clean = text.trim()
@@ -957,13 +1158,32 @@ export default function App() {
         return next
       })
       const cfg = configRef.current
+      // A pending hold treats any new Them final as a continuation, even when
+      // the fragment alone does not look like a complete question.
+      if (speaker === 'Them' && coalesceRef.current && cfg?.interaction.autoAnswer) {
+        if (!askedUids.current.has(utteranceId)) askedUids.current.add(utteranceId)
+        addCoalesceContinuation(utteranceId, clean, cfg.interaction.mergeFollowUpsMs)
+        return
+      }
       if (
         speaker === 'Them' &&
         cfg?.interaction.autoAnswer &&
         isQuestion(clean) &&
         !askedUids.current.has(utteranceId)
       ) {
+        // Whisper sometimes emits a trailing fragment that looks like a
+        // question (observed: a stray "how do"); too few words is never a
+        // real interview question, so record the segment but do not answer.
+        const wordCount = clean.trim().split(/\s+/).filter(Boolean).length
+        if (wordCount < 4) return
         askedUids.current.add(utteranceId)
+        const mergeMs = cfg.interaction.mergeFollowUpsMs
+        // Coalescing applies to final-triggered auto-answers only; early-trigger
+        // asks keep their immediate behavior (explicit opt-in for speed).
+        if (mergeMs > 0) {
+          startCoalesce(clean, utteranceId, mergeMs)
+          return
+        }
         if (
           !streaming.current &&
           Date.now() - lastAnswerAt.current >= cfg.interaction.answerCooldownMs
@@ -974,29 +1194,8 @@ export default function App() {
         }
       }
     },
-    [queueAsk]
+    [addCoalesceContinuation, queueAsk, startCoalesce]
   )
-
-  // Whisper initial_prompt: company + vocabulary first, then the recent
-  // transcript carry-over in the remaining budget.
-  // OpenAI whisper-1 prompt limit is 224 tokens; 700 chars is safe headroom.
-  const whisperPrompt = useCallback((speaker: Speaker): string => {
-    const carry = promptRef.current[speaker]
-    const cfg = configRef.current
-    const company = (cfg?.session.company ?? '').replace(/\s+/g, ' ').trim()
-    const vocabulary = (cfg?.profile.vocabulary ?? '').replace(/\s+/g, ' ').trim()
-    const prefix = [
-      company && `Company: ${company}.`,
-      vocabulary && `Terms: ${vocabulary}.`
-    ]
-      .filter(Boolean)
-      .join(' ')
-    if (!prefix) return carry
-    const budget = 700
-    const clipped = prefix.slice(0, budget)
-    const room = Math.max(0, budget - clipped.length - 1)
-    return `${clipped}${room > 0 && carry ? ` ${carry.slice(-room)}` : ''}`.slice(0, budget)
-  }, [])
 
   const handlePartial = useCallback(
     (speaker: Speaker, wav: ArrayBuffer, uid: number) => {
@@ -1032,6 +1231,12 @@ export default function App() {
             return next
           })
           const cfg = configRef.current
+          if (speaker === 'Them' && coalesceRef.current) {
+            // More speech is still arriving for the held question; the final
+            // chunk will extend the hold, so do not early-ask here.
+            extendCoalesce()
+            return
+          }
           if (
             speaker === 'Them' &&
             cfg?.interaction.autoAnswer &&
@@ -1056,7 +1261,7 @@ export default function App() {
           partialBusy.current[speaker] = false
         })
     },
-    [queueAsk, whisperPrompt]
+    [extendCoalesce, queueAsk, whisperPrompt]
   )
 
   const onWav = useCallback(
@@ -1065,6 +1270,7 @@ export default function App() {
       const info = partialInfo.current[speaker]
       info.uid = uid
       info.finalizing = true
+      if (speaker === 'Them') rememberThemPcm(uid, wav)
       chains.current[speaker] = chains.current[speaker]
         .then(async () => {
           const { text } = await window.api.transcribe(wav, whisperPrompt(speaker))
@@ -1090,7 +1296,7 @@ export default function App() {
           }
         })
     },
-    [appendSegment, removePartial, whisperPrompt]
+    [appendSegment, rememberThemPcm, removePartial, whisperPrompt]
   )
 
   const ask = useCallback(
@@ -1104,7 +1310,21 @@ export default function App() {
     }) => {
       const cfg = configRef.current
       if (!cfg || streaming.current) return
-      const question = opts?.question?.trim()
+      // Claim the lock before resolving a pending coalesce so a second rapid
+      // Answer press cannot start a parallel ask during the re-transcription.
+      streaming.current = true
+      let question = opts?.question?.trim()
+      if (!question && !opts?.answerAnchor && !opts?.answerId) {
+        // Manual Answer/hotkey during a grace hold: prefer the merged question.
+        const merged = await takeCoalesceForManualAsk()
+        if (merged) {
+          const lastThem = [...segmentsRef.current]
+            .reverse()
+            .find((s) => s.speaker === 'Them')
+            ?.text.trim()
+          if (merged.trim() !== lastThem) question = merged
+        }
+      }
       const transcript =
         opts?.transcript ??
         segmentsRef.current
@@ -1112,10 +1332,10 @@ export default function App() {
           .map((s) => `${s.speaker}: ${s.text}`)
           .join('\n')
       if (!question && !transcript && attachments.length === 0) {
+        streaming.current = false
         showToast('No transcript yet — start listening or type a question.')
         return
       }
-      streaming.current = true
       const id = opts?.answerId ?? uid()
       const anchorId =
         opts?.answerAnchor ??
@@ -1189,7 +1409,7 @@ export default function App() {
         dispatchQueuedAsk()
       }
     },
-    [attachments, showToast, dispatchQueuedAsk]
+    [attachments, showToast, dispatchQueuedAsk, takeCoalesceForManualAsk]
   )
 
   const regenerate = useCallback(
@@ -1360,6 +1580,8 @@ export default function App() {
     setAnswers([])
     setAttachments([])
     transcriptSavedRef.current = false
+    cancelCoalesce()
+    themPcm.current = []
     partialInfo.current = {
       You: { uid: -1, applied: 0, finalizing: false },
       Them: { uid: -1, applied: 0, finalizing: false }
@@ -1369,12 +1591,13 @@ export default function App() {
     askedUids.current = new Set()
     pendingAsks.current = []
     promptRef.current = { You: '', Them: '' }
-  }, [])
+  }, [cancelCoalesce])
 
   const startCapture = useCallback(async () => {
     setError(null)
     try {
       const wantMic = configRef.current?.interaction.transcribeMic ?? false
+      const silenceMs = configRef.current?.interaction.silenceSplitMs ?? 900
       const micPromise: Promise<MediaStream | null> = wantMic
         ? startMicStream()
         : Promise.resolve(null)
@@ -1404,7 +1627,8 @@ export default function App() {
             'You',
             onWav,
             (level) => setLevels((prev) => ({ ...prev, you: level })),
-            handlePartial
+            handlePartial,
+            silenceMs
           )
         : undefined
       const them = system
@@ -1412,7 +1636,8 @@ export default function App() {
             'Them',
             onWav,
             (level) => setLevels((prev) => ({ ...prev, them: level })),
-            handlePartial
+            handlePartial,
+            silenceMs
           )
         : undefined
       if (you && mic) await you.startWithStream(mic)
@@ -1420,6 +1645,8 @@ export default function App() {
       engines.current?.you?.stop()
       engines.current?.them?.stop()
       engines.current = { you, them }
+      cancelCoalesce()
+      themPcm.current = []
       askedUids.current = new Set()
       pendingAsks.current = []
       chains.current = { You: Promise.resolve(), Them: Promise.resolve() }
@@ -1434,7 +1661,7 @@ export default function App() {
       setListening(false)
       void window.api.setCaptureListening(false).catch(() => undefined)
     }
-  }, [onWav])
+  }, [onWav, cancelCoalesce])
 
   const beginSession = useCallback(async () => {
     // A fresh session never inherits the previous transcript; resuming from the
@@ -1540,6 +1767,8 @@ export default function App() {
     engines.current?.you?.stop()
     engines.current?.them?.stop()
     engines.current = null
+    cancelCoalesce()
+    themPcm.current = []
     askedUids.current = new Set()
     pendingAsks.current = []
     if (queueTimer.current) {
@@ -1549,7 +1778,7 @@ export default function App() {
     setListening(false)
     void window.api.setCaptureListening(false).catch(() => undefined)
     setLevels({ you: 0, them: 0 })
-  }, [])
+  }, [cancelCoalesce])
 
   // Snapshot shared by the real save and the 120s autosave. Orphan anchors get
   // a placeholder so history keeps the Q→A pairing.
@@ -1734,8 +1963,9 @@ export default function App() {
     const question = input.trim()
     if (!question) return
     setInput('')
+    cancelCoalesce()
     void ask({ question })
-  }, [ask, input])
+  }, [ask, input, cancelCoalesce])
 
   const levelStyle = useMemo(
     () => ({
@@ -2308,7 +2538,10 @@ export default function App() {
                 </button>
                 <button
                   className="btn"
-                  onClick={() => void ask({ question: input.trim() || undefined })}
+                  onClick={() => {
+                    if (input.trim()) cancelCoalesce()
+                    void ask({ question: input.trim() || undefined })
+                  }}
                   disabled={streaming.current}
                 >
                   Answer
@@ -3356,6 +3589,48 @@ function Settings({
             }}
           />
         </label>
+        <label className="field">
+          <span>Merge follow-ups before auto-answer (ms)</span>
+          <input
+            type="number"
+            step="100"
+            min="0"
+            max="5000"
+            value={draft.interaction.mergeFollowUpsMs}
+            onChange={(e) => {
+              const next = Math.round(Number(e.target.value))
+              setInteraction(
+                'mergeFollowUpsMs',
+                Number.isFinite(next) ? Math.min(5000, Math.max(0, next)) : 2000
+              )
+            }}
+          />
+        </label>
+        <p className="hint small">
+          Wait before auto-answering so follow-up speech merges into one question. 0 = answer
+          immediately.
+        </p>
+        <label className="field">
+          <span>Silence split (ms)</span>
+          <input
+            type="number"
+            step="50"
+            min="600"
+            max="1500"
+            value={draft.interaction.silenceSplitMs}
+            onChange={(e) => {
+              const next = Math.round(Number(e.target.value))
+              setInteraction(
+                'silenceSplitMs',
+                Number.isFinite(next) ? Math.min(1500, Math.max(600, next)) : 900
+              )
+            }}
+          />
+        </label>
+        <p className="hint small">
+          How much silence splits an utterance (lower merges short pauses; applies the next time
+          you press Start).
+        </p>
 
         <div className="row gap">
           <button className="btn primary" onClick={() => void onSave(draft)}>

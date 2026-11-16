@@ -154,7 +154,8 @@ export class AudioEngine {
     private readonly speaker: Speaker,
     private readonly onSegment: (speaker: Speaker, wav: ArrayBuffer, utteranceId: number) => void,
     private readonly onLevel: (level: number) => void,
-    private readonly onPartial: (speaker: Speaker, wav: ArrayBuffer, utteranceId: number) => void
+    private readonly onPartial: (speaker: Speaker, wav: ArrayBuffer, utteranceId: number) => void,
+    private readonly silenceMs: number = SILENCE_MS
   ) {}
 
   async startWithStream(stream: MediaStream): Promise<void> {
@@ -324,7 +325,7 @@ export class AudioEngine {
 
     if (this.speechMs >= MAX_CHUNK_MS) {
       this.flush(true)
-    } else if (now - this.lastVoiceAt > SILENCE_MS) {
+    } else if (now - this.lastVoiceAt > this.silenceMs) {
       this.flush(false)
     }
   }

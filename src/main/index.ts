@@ -77,6 +77,8 @@ const DEFAULT_CONFIG: AppConfig = {
   interaction: {
     autoAnswer: false,
     answerCooldownMs: 5000,
+    mergeFollowUpsMs: 2000,
+    silenceSplitMs: 900,
     transcribeMic: false,
     streamingPartials: true,
     earlyAnswer: true,
@@ -189,13 +191,28 @@ function clampAnswerCooldown(value: unknown): number {
   return Math.min(ANSWER_COOLDOWN_MAX_MS, Math.max(ANSWER_COOLDOWN_MIN_MS, Math.round(value)))
 }
 
+// 0 disables the coalescing grace window (legacy immediate auto-answer).
+function clampMergeFollowUps(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 2000
+  return Math.min(5000, Math.max(0, Math.round(value)))
+}
+
+// The AudioEngine needs enough silence to split utterances but not so much that
+// a normal mid-question pause merges across speakers.
+function clampSilenceSplit(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 900
+  return Math.min(1500, Math.max(600, Math.round(value)))
+}
+
 function normalizeInteraction(
   interaction: AppConfig['interaction']
 ): AppConfig['interaction'] {
   if (!isPlainObject(interaction)) return { ...DEFAULT_CONFIG.interaction }
   return {
     ...interaction,
-    answerCooldownMs: clampAnswerCooldown(interaction.answerCooldownMs)
+    answerCooldownMs: clampAnswerCooldown(interaction.answerCooldownMs),
+    mergeFollowUpsMs: clampMergeFollowUps(interaction.mergeFollowUpsMs),
+    silenceSplitMs: clampSilenceSplit(interaction.silenceSplitMs)
   }
 }
 

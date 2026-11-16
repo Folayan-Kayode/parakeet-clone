@@ -36,6 +36,9 @@ are copied. Runs your own speech-to-text and your own LLM (local or API).
   stay at the bottom, and never yanks you down after you scroll up.
 - Follow-up questions that arrive while an answer is streaming are queued (the two most recent
   are kept) and answered once the current answer finishes.
+- Pause-tolerant auto-answer: final-triggered questions wait a configurable grace window, merge
+  follow-up speech, and re-transcribe the combined utterance audio so one paused question gets one
+  answer
 - Segments speech with a lightweight VAD and transcribes each chunk
 - Streams answers from any OpenAI-compatible chat endpoint (Ollama, LM Studio, OpenRouter, OpenAI…)
 - Saved model profiles (each with its own endpoint, key and sampling) and a live-view switcher;
@@ -62,7 +65,8 @@ are copied. Runs your own speech-to-text and your own LLM (local or API).
 - Session history browser (read-only transcripts and answers, paired Q/A, with saved screenshots)
   with per-session and delete-all actions (two-click confirm), plus Markdown export per session
 - Transcript accuracy: Whisper prompt carry-over between chunks (names/wording stay consistent),
-  0.9 s end-of-utterance splitting, and hallucination/echo filtering
+  0.9 s end-of-utterance splitting (configurable as *Silence split* in Settings), and
+  hallucination/echo filtering
 - Meeting auto-detection (Zoom/Teams/Webex/Discord/Slack/Chime/Lark/WhatsApp) with tray
   notification and optional auto-start
 - System tray menu: show/hide, answer, screenshot, settings, move to cursor screen, quit
@@ -346,7 +350,9 @@ endpoints you control — updates are not signature-verified.
 
 - Partials are produced by re-decoding the growing utterance on the whisper server every ~800 ms
   (toggle in Settings). With Auto Answer + "early trigger" (on by default), an answer starts as
-  soon as a partial reads as a complete question; otherwise it fires at end-of-utterance.
+  soon as a partial reads as a complete question; otherwise it fires at end-of-utterance. The merge
+  grace window applies to final-triggered auto-answers only — early-trigger asks stay immediate by
+  design.
 - Speaker labels come from the audio channel (You/Them), not diarization.
 - Questions that arrive mid-answer are queued (max 2, newest kept); older overflow is dropped.
 - PDF import extracts embedded text only; scanned/image-only PDFs need OCR outside the app.
