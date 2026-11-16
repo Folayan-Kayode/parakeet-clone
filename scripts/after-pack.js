@@ -8,7 +8,9 @@ exports.default = async function afterPack(context) {
     version: FuseVersion.V1,
     resetAdHocDarwinSignature: false,
     [FuseV1Options.EnableCookieEncryption]: true,
-    [FuseV1Options.OnlyLoadAppFromAsar]: true
+    [FuseV1Options.OnlyLoadAppFromAsar]: true,
+    // No debugger/`--inspect` hooks into the shipped binary.
+    [FuseV1Options.EnableNodeCliInspectArguments]: false
   })
   console.log(`[fuses] hardened ${exe}`)
 }

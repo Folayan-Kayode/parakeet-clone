@@ -1,10 +1,18 @@
 appId: com.davel.parakeetclone
 productName: Parakeet Clone
+# No spaces in artifact names: latest.yml records these exact filenames, so
+# both --publish and manual GitHub-release attachment keep valid download URLs.
+artifactName: "parakeet-clone-setup-${version}.${ext}"
 directories:
   output: dist
 files:
   - out/**/*
   - package.json
+  - scripts/**/*
+# The .ps1 helpers must be runnable from the install dir; extract them out of
+# app.asar (resources/app.asar.unpacked/scripts).
+asarUnpack:
+  - scripts/**/*
 afterPack: scripts/after-pack.js
 # Artifacts attach to GitHub Releases only when dist is run with GH_TOKEN and
 # --publish; the generic-feed autoUpdater flow is unchanged.

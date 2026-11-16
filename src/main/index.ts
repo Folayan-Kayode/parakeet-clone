@@ -9,6 +9,7 @@ import {
   Tray,
   Menu,
   nativeImage,
+  dialog,
   type Display,
   type NativeImage
 } from 'electron'
@@ -18,14 +19,29 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  renameSync,
   unlinkSync,
   writeFileSync,
   promises as fsPromises
 } from 'node:fs'
+import { lookup } from 'node:dns/promises'
+import { BlockList } from 'node:net'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { autoUpdater } from 'electron-updater'
-import type { AppConfig, CaptureTestCheck, CaptureTestReport, ChatRequest } from '../shared/types'
+import { MODEL_CATALOG } from '../shared/types'
+import {
+  parseStructuredAnswerText,
+  structuredAnswerMarkdown
+} from '../shared/structuredAnswer'
+import type {
+  AppConfig,
+  CaptureTestCheck,
+  CaptureTestReport,
+  ChatRequest,
+  LlmConfig,
+  ModelProfile
+} from '../shared/types'
 
 const execFileAsync = promisify(execFile)
 
@@ -47,7 +63,10 @@ const DEFAULT_CONFIG: AppConfig = {
     // low keeps time-to-first-token fast for live interviews; high for hard algorithmic questions
     reasoningEffort: 'low',
     autoEscalate: false,
-    vision: false
+    vision: false,
+    // Filled from the legacy fields by loadConfig when empty (migration).
+    profiles: [],
+    activeProfileId: ''
   },
   asr: {
     mode: 'whispercpp',
@@ -69,11 +88,13 @@ const DEFAULT_CONFIG: AppConfig = {
     tone: 'formal',
     star: false,
     fillerWords: false,
-    codeLanguage: 'python'
+    codeLanguage: 'python',
+    questionType: 'auto'
   },
   profile: {
     resume: '',
-    background: ''
+    background: '',
+    vocabulary: ''
   },
   session: {
     title: 'Interview session',
@@ -94,10 +115,15 @@ const DEFAULT_CONFIG: AppConfig = {
   },
   meetings: {
     detect: false,
-    autoStart: false
+    autoStart: false,
+    balloon: false
   },
   capture: {
     region: null
+  },
+  audio: {
+    // Audio-thread sample framing; false = legacy ScriptProcessorNode.
+    useWorklet: true
   }
 }
 
@@ -106,8 +132,25 @@ let config: AppConfig = DEFAULT_CONFIG
 const aborters = new Map<string, AbortController>()
 let tray: Tray | null = null
 let meetingTimer: ReturnType<typeof setInterval> | null = null
-let meetingActive = false
+// Sorted label signature of the current non-always-on hits ('' when none).
+let meetingSig = ''
+// Reentrancy guard: a 15s tick must not overlap a still-running tasklist probe.
+let polling = false
+// One-shot balloon guard for always-on-only states (Slack/Discord running).
+let alwaysOnNotified = false
+// Renderer-reported capture state; balloons are suppressed while listening.
+let rendererListening = false
 let updateTimer: ReturnType<typeof setInterval> | null = null
+// Set when config.json failed to parse and was renamed aside (surfaced once).
+let corruptConfigBackupPath: string | null = null
+
+// --- Save-before-quit state machine --------------------------------------
+// Alt+F4 / OS close must not discard a live transcript. One request is made
+// per quit attempt; the renderer acks on receipt and saves, then asks main to
+// quit. A 2s no-ack fallback (and a hard cap after ack) prevents trapping.
+let quitReady = false
+let saveBeforeQuitStarted = false
+let quitWaitTimer: ReturnType<typeof setTimeout> | null = null
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v)
@@ -135,9 +178,195 @@ function clampReasoningEffort(
   return value === 'medium' || value === 'high' ? value : 'low'
 }
 
+const ANSWER_COOLDOWN_MIN_MS = 1000
+const ANSWER_COOLDOWN_MAX_MS = 30_000
+const ANSWER_COOLDOWN_DEFAULT_MS = 5000
+
+// A hand-edited/out-of-range cooldown would hammer the LLM endpoint (or stall
+// auto-answer); the settings input uses the same 1000–30000 bounds.
+function clampAnswerCooldown(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return ANSWER_COOLDOWN_DEFAULT_MS
+  return Math.min(ANSWER_COOLDOWN_MAX_MS, Math.max(ANSWER_COOLDOWN_MIN_MS, Math.round(value)))
+}
+
+function normalizeInteraction(
+  interaction: AppConfig['interaction']
+): AppConfig['interaction'] {
+  if (!isPlainObject(interaction)) return { ...DEFAULT_CONFIG.interaction }
+  return {
+    ...interaction,
+    answerCooldownMs: clampAnswerCooldown(interaction.answerCooldownMs)
+  }
+}
+
+// Hand-edited window bounds may be strings or garbage; setBounds() throws on a
+// non-finite value, so persist only real numbers (null = use the default size).
+function coerceWindowBounds(raw: unknown): AppConfig['window'] {
+  const base = DEFAULT_CONFIG.window
+  if (!isPlainObject(raw)) return { ...base }
+  const num = (value: unknown): number | null => {
+    if (typeof value === 'string' && value.trim() === '') return null
+    const parsed = typeof value === 'number' ? value : Number(value)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+  return {
+    screenMode: raw.screenMode === 'cursor' ? 'cursor' : 'primary',
+    x: num(raw.x),
+    y: num(raw.y),
+    width: num(raw.width),
+    height: num(raw.height)
+  }
+}
+
 // Deliberately narrow: false negatives are fine, false positives cost latency.
 const CODE_RE =
   /\b(algorithm|complexity|time complexity|optimi[sz]e|dynamic programming|data structure|binary search|recursion|two pointers|sliding window)\b/i
+
+// --- Model profiles -------------------------------------------------------
+
+// Pre-v1.2 configs had one flat model config; wrap it so nothing is lost.
+function legacyProfile(llm: LlmConfig): ModelProfile {
+  return {
+    id: 'default',
+    label: 'My model',
+    badge: 'recommended',
+    baseUrl: typeof llm.baseUrl === 'string' ? llm.baseUrl : '',
+    apiKey: typeof llm.apiKey === 'string' ? llm.apiKey : '',
+    model: typeof llm.model === 'string' ? llm.model : '',
+    temperature:
+      typeof llm.temperature === 'number' && Number.isFinite(llm.temperature)
+        ? llm.temperature
+        : null,
+    maxTokens:
+      typeof llm.maxTokens === 'number' && Number.isFinite(llm.maxTokens) ? llm.maxTokens : null,
+    effort:
+      llm.reasoningEffort === 'medium' || llm.reasoningEffort === 'high'
+        ? llm.reasoningEffort
+        : 'low',
+    escalateOnCode: llm.autoEscalate === true
+  }
+}
+
+// Config files are user-editable JSON, so coerce each persisted profile instead
+// of trusting its shape.
+function coerceProfile(raw: unknown, index: number, fallback: ModelProfile): ModelProfile {
+  if (!isPlainObject(raw)) return { ...fallback, id: `profile-${index}` }
+  const str = (value: unknown, def: string): string => (typeof value === 'string' ? value : def)
+  const num = (value: unknown): number | null =>
+    typeof value === 'number' && Number.isFinite(value) ? value : null
+  const effort = raw.effort
+  const badge = raw.badge
+  return {
+    id: str(raw.id, `profile-${index}`),
+    label: str(raw.label, `Model ${index + 1}`),
+    badge:
+      badge === 'fast' || badge === 'slow' || badge === 'very-slow' ? badge : 'recommended',
+    baseUrl: str(raw.baseUrl, fallback.baseUrl),
+    apiKey: str(raw.apiKey, ''),
+    model: str(raw.model, fallback.model),
+    temperature: num(raw.temperature),
+    maxTokens: num(raw.maxTokens),
+    effort: effort === 'low' || effort === 'medium' || effort === 'high' ? effort : 'default',
+    escalateOnCode: raw.escalateOnCode === true
+  }
+}
+
+// Guarantees at least one profile and a valid active id, even from a hand-edited
+// or partially migrated config.
+function normalizeLlm(llm: LlmConfig): LlmConfig {
+  if (!isPlainObject(llm)) return normalizeLlm(DEFAULT_CONFIG.llm)
+  const legacy = legacyProfile(llm)
+  const rawProfiles = Array.isArray(llm.profiles) ? llm.profiles : []
+  const profiles = rawProfiles.map((profile, index) => coerceProfile(profile, index, legacy))
+  if (profiles.length === 0) profiles.push(legacy)
+  const seen = new Set<string>()
+  for (const profile of profiles) {
+    if (seen.has(profile.id)) {
+      // Skip ids that already exist too (e.g. ["a", "a-2", "a"]).
+      let n = 1
+      let candidate = `${profile.id}-${n}`
+      while (seen.has(candidate)) candidate = `${profile.id}-${++n}`
+      profile.id = candidate
+    }
+    seen.add(profile.id)
+  }
+  const activeProfileId = profiles.some((profile) => profile.id === llm.activeProfileId)
+    ? llm.activeProfileId
+    : profiles[0].id
+  return { ...llm, profiles, activeProfileId }
+}
+
+const QUESTION_TYPES = new Set([
+  'auto',
+  'behavioral',
+  'coding',
+  'system-design',
+  'experience',
+  'technical',
+  'other'
+])
+
+function normalizeAnswer(answer: AppConfig['answer']): AppConfig['answer'] {
+  if (!isPlainObject(answer)) return { ...DEFAULT_CONFIG.answer }
+  return QUESTION_TYPES.has(answer.questionType as string)
+    ? answer
+    : { ...answer, questionType: 'auto' }
+}
+
+function activeProfile(llm: LlmConfig): ModelProfile {
+  return (
+    llm.profiles.find((profile) => profile.id === llm.activeProfileId) ??
+    llm.profiles[0] ??
+    legacyProfile(llm)
+  )
+}
+
+interface VendorRules {
+  temperature: boolean
+  effort: boolean
+}
+
+// The catalog is the single source of vendor quirks. Unknown/custom models stay
+// permissive unless they point at Anthropic's endpoint, where Claude 5.x still
+// rejects temperature and ignores reasoning_effort.
+function vendorRulesFor(profile: ModelProfile): VendorRules {
+  const entry = MODEL_CATALOG.find((item) => item.model === profile.model)
+  if (profile.baseUrl.toLowerCase().includes('anthropic.com') || entry?.vendor === 'anthropic') {
+    return { temperature: false, effort: false }
+  }
+  return {
+    temperature: entry ? entry.supportsTemperature : true,
+    effort: entry ? entry.supportsEffort : true
+  }
+}
+
+// Escalation only ever raises low → high, and never when effort is omitted.
+function effectiveEffort(profile: ModelProfile, escalate: boolean): 'low' | 'medium' | 'high' | null {
+  if (profile.effort === 'default') return null
+  const configured = clampReasoningEffort(profile.effort)
+  return escalate && configured === 'low' ? 'high' : configured
+}
+
+function chatBody(
+  profile: ModelProfile,
+  messages: unknown[],
+  opts: { stream: boolean; escalate: boolean }
+): Record<string, unknown> {
+  const rules = vendorRulesFor(profile)
+  const body: Record<string, unknown> = {
+    model: profile.model,
+    stream: opts.stream,
+    messages
+  }
+  // null means "let the vendor choose" — omit the key instead of picking one.
+  if (profile.temperature != null && rules.temperature) {
+    body.temperature = clampTemperature(profile.temperature)
+  }
+  if (profile.maxTokens != null) body.max_tokens = clampMaxTokens(profile.maxTokens)
+  const effort = effectiveEffort(profile, opts.escalate)
+  if (effort && rules.effort) body.reasoning_effort = effort
+  return body
+}
 
 // Prevents a stalled stream from latching streaming.current until app restart.
 const STREAM_IDLE_TIMEOUT_MS = 20_000
@@ -187,6 +416,8 @@ function deepMerge<T>(base: T, patch: unknown): T {
   const out: Record<string, unknown> = { ...base }
   for (const [k, v] of Object.entries(patch)) {
     const cur = (base as Record<string, unknown>)[k]
+    // Arrays (e.g. llm.profiles) are plain values: a patch replaces them wholesale
+    // instead of merging element-by-element, so deleted profiles stay deleted.
     out[k] = isPlainObject(cur) && isPlainObject(v) ? deepMerge(cur, v) : v
   }
   return out as T
@@ -196,12 +427,37 @@ function configPath(): string {
   return join(app.getPath('userData'), 'config.json')
 }
 
+// Corrupt configs are preserved instead of silently overwritten by the first
+// persistConfig(): the user may have hand-edited one and wants it back.
 function loadConfig(): AppConfig {
   try {
     const raw = readFileSync(configPath(), 'utf8').replace(/^\uFEFF/, '')
-    return deepMerge(DEFAULT_CONFIG, JSON.parse(raw))
+    const merged = deepMerge(DEFAULT_CONFIG, JSON.parse(raw))
+    return {
+      ...merged,
+      llm: normalizeLlm(merged.llm),
+      answer: normalizeAnswer(merged.answer),
+      interaction: normalizeInteraction(merged.interaction),
+      window: coerceWindowBounds(merged.window)
+    }
   } catch {
-    return { ...DEFAULT_CONFIG }
+    if (existsSync(configPath())) {
+      try {
+        const backup = `${configPath()}.corrupt-${Date.now()}`
+        renameSync(configPath(), backup)
+        corruptConfigBackupPath = backup
+        console.error('[config] config.json was corrupt; backup at', backup)
+      } catch (err) {
+        console.error('[config] could not back up corrupt config', err)
+      }
+    }
+    return {
+      ...DEFAULT_CONFIG,
+      llm: normalizeLlm(DEFAULT_CONFIG.llm),
+      answer: normalizeAnswer(DEFAULT_CONFIG.answer),
+      interaction: normalizeInteraction(DEFAULT_CONFIG.interaction),
+      window: coerceWindowBounds(DEFAULT_CONFIG.window)
+    }
   }
 }
 
@@ -216,6 +472,45 @@ function persistConfig(): void {
 
 function sendHotkey(name: string): void {
   if (win && !win.isDestroyed()) win.webContents.send('hotkey', name)
+}
+
+// --- Save-before-quit helpers --------------------------------------------
+
+function canReachRenderer(): boolean {
+  return Boolean(
+    win &&
+      !win.isDestroyed() &&
+      !win.webContents.isDestroyed() &&
+      !win.webContents.isCrashed()
+  )
+}
+
+function clearQuitWaitTimer(): void {
+  if (quitWaitTimer) {
+    clearTimeout(quitWaitTimer)
+    quitWaitTimer = null
+  }
+}
+
+// True when this close/quit may proceed. Otherwise asks the renderer once to
+// save (endSession → app:quit-after-save) and blocks the current attempt.
+function guardQuit(): boolean {
+  if (quitReady) return true
+  if (!canReachRenderer()) {
+    // Nothing can be saved; never trap the user behind a dead renderer.
+    quitReady = true
+    clearQuitWaitTimer()
+    return true
+  }
+  if (saveBeforeQuitStarted) return false
+  saveBeforeQuitStarted = true
+  sendHotkey('end-session')
+  quitWaitTimer = setTimeout(() => {
+    quitWaitTimer = null
+    quitReady = true
+    app.quit()
+  }, 2000)
+  return false
 }
 
 function applyStealth(): void {
@@ -239,7 +534,11 @@ function displayForWindow(): Display {
 
 // Shared by the screenshot button/hotkey and the region picker so the preview
 // and the cropped pixels come from the same capped frame.
-async function captureDisplayFrame(): Promise<{ image: NativeImage; display: Display }> {
+async function captureDisplayFrame(): Promise<{
+  image: NativeImage
+  display: Display
+  matched: boolean
+}> {
   const display = displayForWindow()
   const sources = await desktopCapturer.getSources({
     types: ['screen'],
@@ -249,25 +548,29 @@ async function captureDisplayFrame(): Promise<{ image: NativeImage; display: Dis
       height: Math.min(display.size.height, 900)
     }
   })
-  const source =
-    sources.find((s) => s.display_id === String(display.id)) ?? sources[0] ?? null
+  const matched = sources.find((s) => s.display_id === String(display.id))
+  const source = matched ?? sources[0] ?? null
   if (!source) throw new Error('No screen source available')
   if (source.thumbnail.isEmpty()) {
     throw new Error('Screenshot is empty (screen may be locked or DRM protected)')
   }
-  return { image: source.thumbnail, display }
+  return { image: source.thumbnail, display, matched: Boolean(matched) }
 }
 
 function jpegDataUrl(image: NativeImage): string {
   return `data:image/jpeg;base64,${image.toJPEG(85).toString('base64')}`
 }
 
+// Surfaced when desktopCapturer had no source for the overlay's display and
+// we fell back to sources[0] (capture would show the wrong monitor).
+const DISPLAY_MATCH_FAILED_HINT = 'captured a different display — display match failed'
+
 // Region screenshots are bound to the display they were selected on; moving the
 // overlay to another monitor (or clearing the region) falls back to full screen.
 async function captureRegionShot(): Promise<void> {
   if (!win || win.isDestroyed()) return
   try {
-    const { image, display } = await captureDisplayFrame()
+    const { image, display, matched } = await captureDisplayFrame()
     const region = config.capture.region
     let cropped = image
     let hint: string | undefined
@@ -293,6 +596,7 @@ async function captureRegionShot(): Promise<void> {
         cropped = image.crop({ x, y, width: w, height: h })
       }
     }
+    if (!matched) hint = hint ? `${hint} (${DISPLAY_MATCH_FAILED_HINT})` : DISPLAY_MATCH_FAILED_HINT
     if (!win || win.isDestroyed()) return
     win.webContents.send('shot:image', { dataUrl: jpegDataUrl(cropped), hint })
   } catch (err) {
@@ -478,6 +782,17 @@ function createWindow(): void {
   // Keep the OS window title blank even if the renderer ever sets document.title.
   win.on('page-title-updated', (e) => e.preventDefault())
 
+  // Alt+F4 / taskbar close: save the live transcript first (once per attempt).
+  win.on('close', (e) => {
+    if (guardQuit()) return
+    e.preventDefault()
+  })
+
+  // A reload/teardown ends capture; stale "listening" would mute balloons.
+  win.webContents.on('did-finish-load', () => {
+    rendererListening = false
+  })
+
   win.once('ready-to-show', () => {
     if (!win || win.isDestroyed()) return
     if (win.getTitle() !== '') win.setTitle('')
@@ -491,6 +806,7 @@ function createWindow(): void {
 
   win.on('closed', () => {
     win = null
+    rendererListening = false
   })
 
   const devUrl = process.env['ELECTRON_RENDERER_URL']
@@ -552,7 +868,9 @@ const HOTKEYS: HotkeySpec[] = [
     description: 'Region screenshot'
   },
   { id: 'chat', accelerator: 'CommandOrControl+Shift+Space', description: 'Focus chat' },
-  { id: 'hide', accelerator: 'CommandOrControl+H', description: 'Hide' },
+  // Shift added so the overlay's Hide does not shadow the near-universal
+  // Ctrl+H (backspace/replace in editors and terminals).
+  { id: 'hide', accelerator: 'CommandOrControl+Shift+H', description: 'Hide' },
   {
     id: 'toggle-click-through',
     accelerator: 'CommandOrControl+Shift+F9',
@@ -690,30 +1008,443 @@ async function checkCaptureExclusion(): Promise<CaptureTestCheck> {
   }
 }
 
+// --- PDF and job-page imports --------------------------------------------
+
+interface PdfTextItem {
+  str?: string
+  hasEOL?: boolean
+}
+
+interface PdfPageProxy {
+  getTextContent(): Promise<{ items: PdfTextItem[] }>
+  cleanup?(): void
+}
+
+interface PdfDocumentProxy {
+  numPages: number
+  getPage(page: number): Promise<PdfPageProxy>
+  destroy(): Promise<void>
+}
+
+interface PdfModule {
+  getDocument(params: { data: Uint8Array; isEvalSupported?: boolean }): {
+    promise: Promise<PdfDocumentProxy>
+  }
+}
+
+const PDF_LEGACY_MODULE: string = 'pdfjs-dist/legacy/build/pdf.mjs'
+const MAX_PDF_CHARS = 30_000
+const MAX_JOB_CHARS = 10_000
+const MAX_JOB_HTML = 500_000
+const MAX_JOB_STRIP_INPUT = 150_000
+
+async function extractPdfText(
+  filePath: string
+): Promise<{ text: string; pagesProcessed: number; truncated: boolean }> {
+  const buffer = readFileSync(filePath)
+  // A non-literal specifier keeps TypeScript out of pdfjs-dist's subpath typings;
+  // Node resolves the legacy ESM build (fake worker) at runtime.
+  const pdfjs = (await import(/* @vite-ignore */ PDF_LEGACY_MODULE)) as unknown as PdfModule
+  const doc = await pdfjs.getDocument({
+    data: new Uint8Array(buffer),
+    isEvalSupported: false
+  }).promise
+  const pages = doc.numPages
+  const parts: string[] = []
+  let length = 0
+  let pagesProcessed = 0
+  let truncated = false
+  try {
+    for (let pageNumber = 1; pageNumber <= pages; pageNumber++) {
+      const page = await doc.getPage(pageNumber)
+      const content = await page.getTextContent()
+      let pageText = ''
+      for (const item of content.items) {
+        if (typeof item.str !== 'string') continue
+        pageText += item.hasEOL ? `${item.str}\n` : `${item.str} `
+      }
+      const trimmed = pageText.trim()
+      if (trimmed) parts.push(trimmed)
+      length += trimmed.length + 2
+      pagesProcessed += 1
+      page.cleanup?.()
+      if (length >= MAX_PDF_CHARS) {
+        truncated = true
+        break
+      }
+    }
+    const joined = parts.join('\n\n')
+    return {
+      text: joined.slice(0, MAX_PDF_CHARS),
+      pagesProcessed,
+      truncated: truncated || joined.length > MAX_PDF_CHARS
+    }
+  } finally {
+    await doc.destroy()
+  }
+}
+
+// Automation hook, sibling of PC_AUTOSTART; ships inert without the env var.
+// Fire-and-forget so startup is never blocked; logs one JSON line for the verifier.
+function runPdfTestHook(): void {
+  const file = process.env['PC_PDF_TEST']
+  if (!file) return
+  if (!existsSync(file)) {
+    console.log(`[pdf-test] ${JSON.stringify({ ok: false, error: 'file not found' })}`)
+    return
+  }
+  void extractPdfText(file)
+    .then((result) => {
+      try {
+        writeFileSync(`${file}.extract.txt`, result.text, 'utf8')
+      } catch (err) {
+        console.warn('[pdf-test] dump failed', err)
+      }
+      console.log(
+        `[pdf-test] ${JSON.stringify({
+          ok: true,
+          pagesProcessed: result.pagesProcessed,
+          truncated: result.truncated,
+          textLength: result.text.length
+        })}`
+      )
+    })
+    .catch((err) => {
+      const message = err instanceof Error ? err.message : String(err)
+      console.log(`[pdf-test] ${JSON.stringify({ ok: false, error: message.slice(0, 120) })}`)
+    })
+}
+
+const BLOCKED_IPV6 = new BlockList()
+BLOCKED_IPV6.addAddress('::', 'ipv6')
+BLOCKED_IPV6.addAddress('::1', 'ipv6')
+BLOCKED_IPV6.addSubnet('fe80::', 10, 'ipv6')
+BLOCKED_IPV6.addSubnet('fd00::', 8, 'ipv6')
+
+function normalizeHost(hostname: string): string {
+  const host = hostname.toLowerCase()
+  return host.endsWith('.') ? host.slice(0, -1) : host
+}
+
+// Strict dotted quad only: rejects octal/decimal/shorthand IPv4 literals.
+function parseDottedQuad(host: string): number[] | null {
+  const parts = host.split('.')
+  if (parts.length !== 4) return null
+  const octets: number[] = []
+  for (const part of parts) {
+    if (!/^(0|[1-9]\d{0,2})$/.test(part)) return null
+    const value = Number(part)
+    if (value > 255) return null
+    octets.push(value)
+  }
+  return octets
+}
+
+function isPrivateIpv4(octets: number[]): boolean {
+  const [a, b] = octets
+  return (
+    a === 0 ||
+    a === 10 ||
+    a === 127 ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168)
+  )
+}
+
+// URL parsing canonicalizes IPv6 (compressed + lowercase), which also catches
+// mapped addresses written in expanded form.
+function canonicalIpv6(address: string): string {
+  const bare = address.toLowerCase().replace(/^\[|\]$/g, '').split('%')[0]
+  try {
+    return new URL(`http://[${bare}]/`).hostname.replace(/^\[|\]$/g, '')
+  } catch {
+    return bare
+  }
+}
+
+// ::ffff:0:0/96 — compare the embedded low 32 bits against the IPv4 ranges.
+function mappedIpv4(address: string): number[] | null {
+  const host = canonicalIpv6(address)
+  if (!host.startsWith('::ffff:')) return null
+  const tail = host.slice('::ffff:'.length)
+  if (tail.includes('.')) return parseDottedQuad(tail)
+  const groups = tail.split(':')
+  if (groups.length !== 2) return null
+  const hi = Number.parseInt(groups[0], 16)
+  const lo = Number.parseInt(groups[1], 16)
+  if (!Number.isInteger(hi) || !Number.isInteger(lo)) return null
+  return [(hi >> 8) & 0xff, hi & 0xff, (lo >> 8) & 0xff, lo & 0xff]
+}
+
+function isBlockedIpv6(address: string): boolean {
+  const mapped = mappedIpv4(address)
+  if (mapped) return isPrivateIpv4(mapped)
+  return BLOCKED_IPV6.check(canonicalIpv6(address), 'ipv6')
+}
+
+function isBlockedHost(hostname: string): boolean {
+  const host = normalizeHost(hostname)
+  if (host === 'localhost' || host.endsWith('.local')) return true
+  if (/^[0-9.]+$/.test(host)) {
+    // Anything numeric must be a strict public dotted quad; this blocks
+    // 2130706433, 127.1 and 0177.0.0.1 before any resolver sees them.
+    const quad = parseDottedQuad(host)
+    return quad === null || isPrivateIpv4(quad)
+  }
+  if (host.includes(':')) return isBlockedIpv6(host)
+  return false
+}
+
+async function assertPublicHost(hostname: string): Promise<void> {
+  const host = normalizeHost(hostname)
+  if (isBlockedHost(host)) throw new Error('Local/private URLs are not supported')
+  const lookupHost = host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host
+  let addresses: Array<{ address: string; family: number }>
+  try {
+    addresses = await lookup(lookupHost, { all: true })
+  } catch {
+    throw new Error('Could not resolve host')
+  }
+  for (const entry of addresses) {
+    if (entry.family === 4) {
+      const octets = parseDottedQuad(entry.address)
+      if (!octets || isPrivateIpv4(octets)) {
+        throw new Error('Local/private URLs are not supported')
+      }
+    } else if (isBlockedIpv6(entry.address)) {
+      throw new Error('Local/private URLs are not supported')
+    }
+  }
+}
+
+function decodeCodePoint(value: number): string {
+  if (!Number.isInteger(value) || value < 0 || value > 0x10ffff) return ''
+  if (value >= 0xd800 && value <= 0xdfff) return ''
+  return String.fromCodePoint(value)
+}
+
+function decodeHtml(text: string): string {
+  // &amp; is decoded last so a literal "&amp;lt;" stays "&lt;".
+  return text
+    .replace(/&#x([0-9a-f]+);/gi, (_match, hex: string) =>
+      decodeCodePoint(Number.parseInt(hex, 16))
+    )
+    .replace(/&#(\d+);/g, (_match, dec: string) => decodeCodePoint(Number(dec)))
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&apos;/gi, "'")
+    .replace(/&amp;/gi, '&')
+}
+
+// ASCII-only lowercasing keeps indices aligned with the original string.
+function asciiLower(text: string): string {
+  return text.replace(/[A-Z]/g, (char) => char.toLowerCase())
+}
+
+function isTagNameChar(code: number): boolean {
+  return (
+    (code >= 48 && code <= 57) || // 0-9
+    (code >= 65 && code <= 90) || // A-Z
+    (code >= 97 && code <= 122) // a-z
+  )
+}
+
+// Single-pass tag tokenizer: no regex over the whole document. Script/style
+// bodies are skipped wholesale; <title> and og:title are captured separately.
+function stripHtml(html: string): { text: string; title: string } {
+  const source = html.slice(0, MAX_JOB_STRIP_INPUT)
+  const lower = asciiLower(source)
+  let out = ''
+  let docTitle = ''
+  let ogTitle = ''
+  let i = 0
+
+  while (i < source.length) {
+    const lt = source.indexOf('<', i)
+    if (lt < 0) {
+      out += source.slice(i)
+      break
+    }
+    out += source.slice(i, lt)
+
+    if (lower.startsWith('<!--', lt)) {
+      const end = lower.indexOf('-->', lt + 4)
+      if (end < 0) break
+      out += ' '
+      i = end + 3
+      continue
+    }
+
+    const gt = source.indexOf('>', lt + 1)
+    if (gt < 0) break
+
+    let p = lt + 1
+    const closing = source[p] === '/'
+    if (closing) p++
+    const nameStart = p
+    while (p < source.length && isTagNameChar(source.charCodeAt(p))) p++
+    const name = lower.slice(nameStart, p)
+
+    if (!closing && (name === 'script' || name === 'style')) {
+      const close = lower.indexOf(`</${name}`, gt + 1)
+      if (close < 0) break
+      const closeGt = source.indexOf('>', close)
+      if (closeGt < 0) break
+      out += ' '
+      i = closeGt + 1
+      continue
+    }
+
+    if (!closing && name === 'title') {
+      const close = lower.indexOf('</title', gt + 1)
+      if (close < 0) {
+        i = gt + 1
+        continue
+      }
+      if (!docTitle) docTitle = source.slice(gt + 1, close)
+      const closeGt = source.indexOf('>', close)
+      if (closeGt < 0) break
+      out += ' '
+      i = closeGt + 1
+      continue
+    }
+
+    if (!closing && name === 'meta' && !ogTitle) {
+      const tag = source.slice(lt, gt + 1)
+      if (/(?:property|name)\s*=\s*["']?og:title\b/i.test(tag)) {
+        const content = /(?:^|\s)content\s*=\s*("([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(tag)
+        ogTitle = content?.[2] ?? content?.[3] ?? content?.[4] ?? ''
+      }
+    }
+
+    out += ' '
+    i = gt + 1
+  }
+
+  return {
+    title: decodeHtml((ogTitle || docTitle).replace(/\s+/g, ' ').trim()).slice(0, 200),
+    text: decodeHtml(out).replace(/\s+/g, ' ').trim()
+  }
+}
+
+async function readBodyBounded(
+  res: Response,
+  controller: AbortController
+): Promise<string> {
+  if (!res.body) return ''
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let text = ''
+  let bytes = 0
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (!value) continue
+      bytes += value.byteLength
+      if (bytes > MAX_JOB_HTML) {
+        controller.abort()
+        throw new Error('response too large')
+      }
+      text += decoder.decode(value, { stream: true })
+    }
+    text += decoder.decode()
+    return text
+  } finally {
+    reader.releaseLock()
+  }
+}
+
+async function fetchJobPage(url: string): Promise<{ title: string; text: string }> {
+  let parsed: URL
+  try {
+    parsed = new URL(url)
+  } catch {
+    throw new Error('Invalid URL')
+  }
+
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 15_000)
+  const checkedHosts = new Set<string>()
+  const headers = {
+    'User-Agent': `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${process.versions.chrome} Electron/${process.versions.electron} Safari/537.36`,
+    'Accept-Language': 'en-US,en;q=0.9',
+    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+  }
+
+  try {
+    let current = parsed
+    let res: Response | null = null
+    // Manual redirects so every hop is DNS-checked before we fetch it.
+    for (let hop = 0; hop <= 5; hop++) {
+      if (current.protocol !== 'http:' && current.protocol !== 'https:') {
+        throw new Error('Only http(s) links are supported')
+      }
+      const host = normalizeHost(current.hostname)
+      if (!checkedHosts.has(host)) {
+        await assertPublicHost(host)
+        checkedHosts.add(host)
+      }
+      res = await fetch(current.toString(), {
+        redirect: 'manual',
+        signal: controller.signal,
+        headers
+      })
+      if (res.status >= 300 && res.status < 400) {
+        const location = res.headers.get('location')
+        if (!location) break
+        current = new URL(location, current)
+        continue
+      }
+      break
+    }
+    if (!res) throw new Error('Fetch failed')
+    if (res.status >= 300 && res.status < 400) throw new Error('Too many redirects')
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+
+    const html = await readBodyBounded(res, controller)
+    const { title, text } = stripHtml(html)
+    return { title, text: text.slice(0, MAX_JOB_CHARS) }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+// One fixed autosave slot, overwritten while listening (see the renderer's
+// 120s timer). A successful real save removes it so Home stops offering it.
+const AUTOSAVE_FILE = 'autosave.json'
+
+function clearAutosave(dir: string): void {
+  for (const file of [AUTOSAVE_FILE, 'autosave.meta.json']) {
+    const target = join(dir, file)
+    if (!existsSync(target)) continue
+    try {
+      unlinkSync(target)
+    } catch (err) {
+      console.error('Could not remove autosave', err)
+    }
+  }
+}
+
 function registerIpc(): void {
-  ipcMain.handle('config:get', () => config)
+  ipcMain.handle('config:get', () => ({ config, corruptBackupPath: corruptConfigBackupPath }))
 
   ipcMain.handle('config:set', (_e, patch: Partial<AppConfig>) => {
-    config = deepMerge(config, patch)
+    const merged = deepMerge(config, patch)
+    config = {
+      ...merged,
+      llm: normalizeLlm(merged.llm),
+      answer: normalizeAnswer(merged.answer),
+      interaction: normalizeInteraction(merged.interaction)
+    }
     persistConfig()
     applyStealth()
     applyMeetingConfig()
     setupUpdates()
     if (win && !win.isDestroyed()) win.webContents.send('config:changed', config)
-    return config
-  })
-
-  ipcMain.handle('win:set-ignore-mouse', (_e, value: boolean) => {
-    config = { ...config, clickThrough: value }
-    persistConfig()
-    applyStealth()
-    return config
-  })
-
-  ipcMain.handle('win:set-private-mode', (_e, value: boolean) => {
-    config = { ...config, privateMode: value }
-    persistConfig()
-    applyStealth()
     return config
   })
 
@@ -723,33 +1454,57 @@ function registerIpc(): void {
 
   ipcMain.handle('win:quit', () => app.quit())
 
-  ipcMain.handle('displays:list', () =>
-    screen.getAllDisplays().map((d, index) => ({
-      id: d.id,
-      label: `Display ${index + 1}`,
-      primary: d.id === screen.getPrimaryDisplay().id,
-      bounds: d.bounds
-    }))
-  )
+  // Renderer received end-session (and is saving); a hung renderer still quits.
+  ipcMain.handle('app:end-session-ack', () => {
+    if (!saveBeforeQuitStarted || quitReady) return
+    clearQuitWaitTimer()
+    quitWaitTimer = setTimeout(() => {
+      quitWaitTimer = null
+      quitReady = true
+      app.quit()
+    }, 20_000)
+  })
+
+  ipcMain.handle('app:quit-after-save', () => {
+    saveBeforeQuitStarted = true
+    quitReady = true
+    clearQuitWaitTimer()
+    app.quit()
+  })
+
+  // Balloons are muted while capture runs (they render on the shared screen).
+  ipcMain.handle('capture:set-listening', (_e, value: boolean) => {
+    rendererListening = value === true
+  })
 
   ipcMain.handle('displays:move-to-cursor', () => {
     moveToCursorDisplay()
     return true
   })
 
-  ipcMain.handle('displays:move-to-index', (_e, index: number) => {
-    const display = screen.getAllDisplays()[index]
-    if (!display) return false
-    topCenterOn(display)
-    saveWindowPosition()
-    return true
+  ipcMain.handle('docs:extract-pdf', async () => {
+    const result =
+      win && !win.isDestroyed()
+        ? await dialog.showOpenDialog(win, {
+            properties: ['openFile'],
+            filters: [{ name: 'PDF documents', extensions: ['pdf'] }]
+          })
+        : await dialog.showOpenDialog({
+            properties: ['openFile'],
+            filters: [{ name: 'PDF documents', extensions: ['pdf'] }]
+          })
+    if (result.canceled || result.filePaths.length === 0) return null
+    try {
+      return await extractPdfText(result.filePaths[0])
+    } catch (err) {
+      throw new Error(`PDF import failed: ${err instanceof Error ? err.message : String(err)}`)
+    }
   })
 
-  ipcMain.handle('app:info', () => ({
-    version: app.getVersion(),
-    platform: process.platform,
-    configPath: configPath()
-  }))
+  ipcMain.handle('jobs:fetch', async (_e, url: string) => {
+    if (typeof url !== 'string' || !url.trim()) throw new Error('Invalid URL')
+    return fetchJobPage(url.trim())
+  })
 
   ipcMain.handle('hotkeys:list', () =>
     HOTKEYS.map((hotkey) => ({
@@ -759,22 +1514,58 @@ function registerIpc(): void {
     }))
   )
 
-  ipcMain.handle('session:save', (_e, payload: unknown) => {
+  ipcMain.handle('session:save', (_e, payload: unknown, opts?: { autosave?: boolean }) => {
+    const autosave = opts?.autosave === true
     try {
       const dir = join(app.getPath('userData'), 'sessions')
       mkdirSync(dir, { recursive: true })
-      const name = `session-${new Date().toISOString().replace(/[:.]/g, '-')}.json`
-      writeFileSync(join(dir, name), JSON.stringify(payload, null, 2), 'utf8')
+      const name = autosave
+        ? AUTOSAVE_FILE
+        : `session-${new Date().toISOString().replace(/[:.]/g, '-')}.json`
+      const target = join(dir, name)
+      const temp = `${target}.tmp`
+      writeFileSync(temp, JSON.stringify(payload, null, 2), 'utf8')
+      renameSync(temp, target)
+      // Summary sidecar keeps sessions:list from parsing image-heavy JSON.
+      try {
+        const data = (payload && typeof payload === 'object' ? payload : {}) as Record<
+          string,
+          unknown
+        >
+        const summary = {
+          company: typeof data.company === 'string' ? data.company : '',
+          ts: Date.now(),
+          title: typeof data.title === 'string' ? data.title : 'Untitled',
+          endedAt: typeof data.endedAt === 'string' ? data.endedAt : null,
+          segments: Array.isArray(data.segments) ? data.segments.length : 0,
+          answers: Array.isArray(data.answers) ? data.answers.length : 0
+        }
+        const metaTarget = join(dir, `${name.replace(/\.json$/i, '')}.meta.json`)
+        const metaTemp = `${metaTarget}.tmp`
+        writeFileSync(metaTemp, JSON.stringify(summary, null, 2), 'utf8')
+        renameSync(metaTemp, metaTarget)
+      } catch (err) {
+        console.error('Session summary save failed', err)
+      }
+      // The live transcript is now a real session; drop the recovery slot.
+      if (!autosave) clearAutosave(dir)
       return name
     } catch (err) {
       console.error('Session save failed', err)
-      return null
+      // Reject instead of returning null: the renderer treats a falsy result as
+      // "nothing to save", so a failed transcript write would look like success.
+      throw new Error(
+        `Session save failed: ${err instanceof Error ? err.message : String(err)}`
+      )
     }
   })
 
   ipcMain.handle('shot:capture', async () => {
-    const { image } = await captureDisplayFrame()
-    return jpegDataUrl(image)
+    const { image, matched } = await captureDisplayFrame()
+    return {
+      dataUrl: jpegDataUrl(image),
+      hint: matched ? undefined : DISPLAY_MATCH_FAILED_HINT
+    }
   })
 
   // Source frame + display id for the in-overlay region picker (not attached).
@@ -799,20 +1590,19 @@ function registerIpc(): void {
 
   ipcMain.handle('test:llm', async () => {
     try {
-      const endpoint = config.llm.baseUrl.replace(/\/+$/, '') + '/chat/completions'
+      const profile = activeProfile(config.llm)
+      const endpoint = profile.baseUrl.replace(/\/+$/, '') + '/chat/completions'
       const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-      if (config.llm.apiKey) headers['Authorization'] = `Bearer ${config.llm.apiKey}`
+      if (profile.apiKey) headers['Authorization'] = `Bearer ${profile.apiKey}`
       const res = await fetch(endpoint, {
         method: 'POST',
         headers,
-        body: JSON.stringify({
-          model: config.llm.model,
-          stream: false,
-          temperature: clampTemperature(config.llm.temperature),
-          max_tokens: clampMaxTokens(config.llm.maxTokens),
-          reasoning_effort: clampReasoningEffort(config.llm.reasoningEffort),
-          messages: [{ role: 'user', content: 'Reply with exactly: OK' }]
-        })
+        body: JSON.stringify(
+          chatBody(profile, [{ role: 'user', content: 'Reply with exactly: OK' }], {
+            stream: false,
+            escalate: false
+          })
+        )
       })
       const raw = await res.text()
       if (!res.ok) throw new Error(`HTTP ${res.status}: ${raw.slice(0, 200)}`)
@@ -926,9 +1716,30 @@ function registerIpc(): void {
       const dir = join(app.getPath('userData'), 'sessions')
       if (!existsSync(dir)) return []
       return readdirSync(dir)
-        .filter((f) => /^[\w.-]+\.json$/.test(f))
+        .filter((f) => /^[\w.-]+\.json$/.test(f) && !f.endsWith('.meta.json'))
         .map((name) => {
           try {
+            const metaPath = join(dir, `${name.replace(/\.json$/i, '')}.meta.json`)
+            if (existsSync(metaPath)) {
+              try {
+                const meta = JSON.parse(readFileSync(metaPath, 'utf8')) as Record<string, unknown>
+                return {
+                  name,
+                  title: typeof meta.title === 'string' ? meta.title : 'Untitled',
+                  company: typeof meta.company === 'string' ? meta.company : '',
+                  endedAt:
+                    typeof meta.endedAt === 'string'
+                      ? meta.endedAt
+                      : typeof meta.ts === 'number'
+                        ? new Date(meta.ts).toISOString()
+                        : null,
+                  segments: typeof meta.segments === 'number' ? meta.segments : 0,
+                  answers: typeof meta.answers === 'number' ? meta.answers : 0
+                }
+              } catch {
+                /* corrupt sidecar: fall back to the full session */
+              }
+            }
             const data = JSON.parse(readFileSync(join(dir, name), 'utf8')) as Record<
               string,
               unknown
@@ -936,6 +1747,7 @@ function registerIpc(): void {
             return {
               name,
               title: typeof data.title === 'string' ? data.title : 'Untitled',
+              company: typeof data.company === 'string' ? data.company : '',
               endedAt: typeof data.endedAt === 'string' ? data.endedAt : null,
               segments: Array.isArray(data.segments) ? data.segments.length : 0,
               answers: Array.isArray(data.answers) ? data.answers.length : 0
@@ -975,16 +1787,19 @@ function registerIpc(): void {
     for (const answer of data.answers ?? []) {
       const body = (answer.text || answer.error || '').trim()
       if (!body) continue
-      const quote = body
+      const fallback = body
         .split('\n')
         .map((line) => `> ${line}`)
         .join('\n')
+      const rendered = answer.error
+        ? fallback
+        : structuredAnswerMarkdown(parseStructuredAnswerText(answer.text ?? ''), fallback)
       if (answer.anchorId) {
         const list = answersByAnchor.get(answer.anchorId) ?? []
-        list.push(quote)
+        list.push(rendered)
         answersByAnchor.set(answer.anchorId, list)
       } else {
-        loose.push(quote)
+        loose.push(rendered)
       }
     }
     const lines: string[] = [`# ${data.title?.trim() || 'Session'}`, '']
@@ -1016,8 +1831,17 @@ function registerIpc(): void {
     }
     const dir = join(app.getPath('userData'), 'sessions')
     unlinkSync(join(dir, name))
-    // Drop the sibling Markdown export too, if one was generated.
-    const exportPath = join(dir, `${name.replace(/\.json$/i, '')}.md`)
+    // Drop the summary sidecar and the sibling Markdown export too.
+    const stem = name.replace(/\.json$/i, '')
+    const metaPath = join(dir, `${stem}.meta.json`)
+    if (existsSync(metaPath)) {
+      try {
+        unlinkSync(metaPath)
+      } catch (err) {
+        console.error('Could not delete session summary', err)
+      }
+    }
+    const exportPath = join(dir, `${stem}.md`)
     if (existsSync(exportPath)) {
       try {
         unlinkSync(exportPath)
@@ -1033,9 +1857,10 @@ function registerIpc(): void {
     if (!existsSync(dir)) return 0
     let count = 0
     for (const file of readdirSync(dir)) {
-      const isSession = /^[\w.-]+\.json$/.test(file)
+      const isMeta = file.endsWith('.meta.json')
+      const isSession = /^[\w.-]+\.json$/.test(file) && !isMeta
       const isExport = /^[\w.-]+\.md$/.test(file)
-      if (!isSession && !isExport) continue
+      if (!isSession && !isExport && !isMeta) continue
       try {
         unlinkSync(join(dir, file))
         if (isSession) count += 1
@@ -1059,6 +1884,9 @@ function registerIpc(): void {
   })
 
   ipcMain.handle('updates:install', () => {
+    // Update restart must not wait on a transcript save prompt.
+    quitReady = true
+    clearQuitWaitTimer()
     autoUpdater.quitAndInstall()
   })
 
@@ -1066,9 +1894,12 @@ function registerIpc(): void {
     const ctrl = new AbortController()
     aborters.set(req.id, ctrl)
 
-    const endpoint = config.llm.baseUrl.replace(/\/+$/, '') + '/chat/completions'
+    // Resolved per request from the live config, so switching profiles changes
+    // the next ask without a restart or touching an in-flight stream.
+    const profile = activeProfile(config.llm)
+    const endpoint = profile.baseUrl.replace(/\/+$/, '') + '/chat/completions'
     const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-    if (config.llm.apiKey) headers['Authorization'] = `Bearer ${config.llm.apiKey}`
+    if (profile.apiKey) headers['Authorization'] = `Bearer ${profile.apiKey}`
 
     const last = req.messages[req.messages.length - 1]
     const messages = [...req.messages]
@@ -1083,26 +1914,28 @@ function registerIpc(): void {
       }
     }
 
-    const configuredEffort = clampReasoningEffort(config.llm.reasoningEffort)
     // Auto-escalate only from 'low'; the regex is intentionally narrow.
-    const effectiveEffort =
-      config.llm.autoEscalate &&
-      configuredEffort === 'low' &&
-      (req.images.length > 0 || CODE_RE.test(last?.content ?? ''))
-        ? 'high'
-        : configuredEffort
+    // An explicit coding question type acts as escalateOnCode for this ask.
+    const codingAsk = req.questionType === 'coding'
+    const escalate =
+      (codingAsk || profile.escalateOnCode) &&
+      (codingAsk || req.images.length > 0 || CODE_RE.test(last?.content ?? ''))
 
-    const body = {
-      model: config.llm.model,
-      stream: true,
-      temperature: clampTemperature(config.llm.temperature),
-      max_tokens: clampMaxTokens(config.llm.maxTokens),
-      reasoning_effort: effectiveEffort,
-      messages
-    }
+    const body = chatBody(profile, messages, { stream: true, escalate })
 
     let streamIdleTimer: ReturnType<typeof setTimeout> | null = null
     let streamTimedOut = false
+    // A dead endpoint can hang the TCP/TLS connect far longer than the 20s
+    // idle watchdog (which only starts after headers). Cap the pre-header phase
+    // at 15s; the idle watchdog keeps its 20s semantics after that.
+    // The timer is cleared once headers arrive: a live fetch's signal also
+    // governs body streaming, so a remaining 15s timer would cut long answers.
+    const connectCtrl = new AbortController()
+    const connectTimer = setTimeout(
+      () => connectCtrl.abort(new DOMException('Connect timeout', 'TimeoutError')),
+      15_000
+    )
+    const connectSignal = AbortSignal.any([ctrl.signal, connectCtrl.signal])
     const clearStreamIdleTimer = (): void => {
       if (streamIdleTimer) {
         clearTimeout(streamIdleTimer)
@@ -1115,9 +1948,10 @@ function registerIpc(): void {
       // tokens flow there is no retry, so the user never sees a silent restart.
       const res = await fetchChatWithRetry(
         endpoint,
-        { method: 'POST', headers, body: JSON.stringify(body), signal: ctrl.signal },
+        { method: 'POST', headers, body: JSON.stringify(body), signal: connectSignal },
         ctrl.signal
       )
+      clearTimeout(connectTimer)
 
       const stream = res.body
       if (!stream) throw new Error('LLM error: response has no body')
@@ -1168,14 +2002,18 @@ function registerIpc(): void {
       console.log(`[llm-answer] ${full}`)
       return { ok: true, text: full }
     } catch (err) {
+      const connectTimedOut = connectCtrl.signal.aborted && !ctrl.signal.aborted
       const message = streamTimedOut
         ? 'no response from the model for 20s — check your endpoint'
-        : err instanceof Error
-          ? err.message
-          : String(err)
+        : connectTimedOut
+          ? 'no response from the model within 15s — check your endpoint'
+          : err instanceof Error
+            ? err.message
+            : String(err)
       event.sender.send('llm:error', { id: req.id, message })
       throw new Error(message)
     } finally {
+      clearTimeout(connectTimer)
       clearStreamIdleTimer()
       aborters.delete(req.id)
     }
@@ -1186,6 +2024,9 @@ function registerIpc(): void {
     aborters.delete(id)
   })
 }
+
+// A stalled whisper-server must fail visibly instead of hanging the ASR chain.
+const ASR_TIMEOUT_MS = 30_000
 
 async function transcribeWav(bytes: Uint8Array, prompt?: string): Promise<string> {
   const form = new FormData()
@@ -1203,7 +2044,31 @@ async function transcribeWav(bytes: Uint8Array, prompt?: string): Promise<string
     if (config.asr.apiKey) headers['Authorization'] = `Bearer ${config.asr.apiKey}`
   }
 
-  const res = await fetch(config.asr.url, { method: 'POST', body: form, headers })
+  const send = (): Promise<Response> =>
+    fetch(config.asr.url, {
+      method: 'POST',
+      body: form,
+      headers,
+      // Fresh 30s budget per attempt, so a retry cannot inherit a spent timeout.
+      signal: AbortSignal.timeout(ASR_TIMEOUT_MS)
+    })
+  let res: Response
+  try {
+    res = await send()
+  } catch (err) {
+    // One retry only for a transport-level failure (connection reset, DNS
+    // flap) — never for an HTTP error status or our own timeout/abort. Covers
+    // the transient network blips that otherwise drop a whole transcript chunk.
+    if (
+      err instanceof DOMException &&
+      (err.name === 'TimeoutError' || err.name === 'AbortError')
+    ) {
+      throw err
+    }
+    console.warn('[asr] network error — retrying once', errorText(err))
+    await new Promise((resolve) => setTimeout(resolve, 1000))
+    res = await send()
+  }
   const raw = await res.text()
   if (!res.ok) throw new Error(`ASR error ${res.status}: ${raw.slice(0, 300)}`)
 
@@ -1309,6 +2174,57 @@ const MEETING_APPS = [
 // Apps that are commonly always running: notify, but never auto-start capture.
 const ALWAYS_ON_APPS = ['discord.exe', 'slack.exe', 'whatsapp.exe']
 
+// Browser meetings have no process signature, so match app-shaped window titles.
+// `strong` titles are meeting-specific enough to auto-start capture; generic
+// titles ("Meet - abc", "FaceTime") only notify, since a browser tab or the
+// FaceTime app can sit open all day.
+const MEETING_TITLE_RE: Array<{ re: RegExp; strong: boolean }> = [
+  { re: / - zoom( meeting)?$/i, strong: false }, // "... - Zoom" / "... - Zoom Meeting"
+  {
+    re: /(^| - )zoom meeting( - (google chrome|microsoft edge)| — (google chrome|microsoft edge))?$/i,
+    strong: false
+  }, // "Zoom Meeting" / "Zoom Meeting - Google Chrome" / "Zoom Meeting — Microsoft Edge"
+  // The em-dash in Edge window separators is intentional (TS source is UTF-8;
+  // only the .ps1 scripts must stay ASCII).
+  // Browser-suffixed Meet titles only; non-browser "Meet - <name>" titles rely
+  // on the generic pattern below and are notify-only.
+  {
+    re: /^meet(\.google\.com)?(?: - \S+| — \S+)?(?: - google chrome| — microsoft edge)$/i,
+    strong: true
+  }, // "Meet - abc - Google Chrome" / "meet.google.com — Microsoft Edge"
+  { re: /^meet - .+$/i, strong: false }, // "Meet - abc-def"
+  { re: /( - |^)microsoft teams( meeting.*)?$/i, strong: true }, // "Microsoft Teams Meeting" / "... - Microsoft Teams"
+  { re: / - webex meeting( \|.*)?$/i, strong: false }, // "... - Webex Meeting | ..."
+  { re: /facetime$/i, strong: false }, // "FaceTime"
+  { re: / - discord$/i, strong: false }, // "... - Discord"
+  { re: /zoom workplace/i, strong: true } // "Zoom Workplace"
+]
+
+async function listMeetingTitles(): Promise<string[]> {
+  try {
+    const sources = await desktopCapturer.getSources({
+      types: ['window'],
+      thumbnailSize: { width: 0, height: 0 },
+      fetchWindowIcons: false
+    })
+    return sources.map((source) => source.name.trim()).filter(Boolean)
+  } catch {
+    return []
+  }
+}
+
+function meetingTitleHit(titles: string[]): { title: string; strong: boolean } | null {
+  let hit: { title: string; strong: boolean } | null = null
+  for (const title of titles) {
+    for (const pattern of MEETING_TITLE_RE) {
+      if (!pattern.re.test(title)) continue
+      if (!hit) hit = { title, strong: pattern.strong }
+      else if (pattern.strong) hit.strong = true
+    }
+  }
+  return hit
+}
+
 async function listProcessNames(): Promise<string[]> {
   try {
     const { stdout } = await execFileAsync('tasklist', ['/fo', 'csv', '/nh'], {
@@ -1328,38 +2244,94 @@ async function listProcessNames(): Promise<string[]> {
 }
 
 async function pollMeeting(): Promise<void> {
-  const names = await listProcessNames()
-  const hit = names.find((name) => MEETING_APPS.includes(name))
-  if (hit && !meetingActive) {
-    meetingActive = true
-    console.log('[meeting] detected', hit)
-    try {
-      tray?.displayBalloon({
-        title: 'Meeting detected',
-        content: `${hit} started — Parakeet Clone is ready`,
-        iconType: 'info'
-      })
-    } catch {
-      /* balloons unsupported */
+  if (polling) return
+  polling = true
+  try {
+    const [names, titles] = await Promise.all([listProcessNames(), listMeetingTitles()])
+    const processHits = names.filter((name) => MEETING_APPS.includes(name))
+    const titleHit = meetingTitleHit(titles)
+    const titleAlwaysOn = titleHit
+      ? /\b(discord|slack|whatsapp)\b/i.test(titleHit.title)
+      : false
+    const hits = [
+      ...processHits.map((name) => ({ label: name, alwaysOn: ALWAYS_ON_APPS.includes(name) })),
+      ...(titleHit ? [{ label: titleHit.title, alwaysOn: titleAlwaysOn }] : [])
+    ]
+    const nonAlwaysOn = hits.filter((hit) => !hit.alwaysOn)
+    // Auto-start needs a confirmed meeting app process or a meeting-specific
+    // browser/Teams/Zoom title; generic "Meet - X" / "FaceTime" titles only
+    // notify, since they can be an idle tab or app.
+    const autoStartEligible =
+      processHits.some((name) => !ALWAYS_ON_APPS.includes(name)) || titleHit?.strong === true
+    // Slack all day + a meeting starting at 2pm must still auto-start: the latch
+    // tracks the non-always-on signature, not just "something is active".
+    const sig = nonAlwaysOn
+      .map((hit) => hit.label)
+      .sort()
+      .join('|')
+    const active = hits.length > 0
+
+    // Balloons paint on the shared screen, so they are opt-in and never include
+    // the matched app name/window title (which can leak the meeting subject).
+    const notify = (kind: 'meeting' | 'background'): void => {
+      if (!config.meetings.balloon || rendererListening) return
+      try {
+        tray?.displayBalloon({
+          title: 'Parakeet Clone',
+          content: kind === 'meeting' ? 'Meeting detected' : 'Background app detected',
+          iconType: 'info'
+        })
+      } catch {
+        /* balloons unsupported */
+      }
     }
-    if (config.meetings.autoStart && !ALWAYS_ON_APPS.includes(hit)) sendHotkey('autostart')
-  } else if (!hit && meetingActive) {
-    meetingActive = false
-    console.log('[meeting] ended')
+
+    if (sig && sig !== meetingSig) {
+      alwaysOnNotified = false
+      const signals: string[] = []
+      if (processHits.length > 0) signals.push(`process ${processHits.join(', ')}`)
+      if (titleHit) signals.push(`window "${titleHit.title}"`)
+      console.log('[meeting] detected via', signals.join(' + '))
+      notify('meeting')
+      if (config.meetings.autoStart && autoStartEligible) sendHotkey('autostart')
+      else if (config.meetings.autoStart)
+        console.log('[meeting] title match only — not auto-starting')
+      meetingSig = sig
+    } else if (!sig && meetingSig) {
+      meetingSig = ''
+      console.log('[meeting] ended')
+      // Returning to an always-on-only state should not re-notify on the next poll.
+      alwaysOnNotified = active
+    } else if (active && !sig && !alwaysOnNotified) {
+      alwaysOnNotified = true
+      console.log(
+        '[meeting] always-on app detected (no auto-start):',
+        hits.map((hit) => hit.label).join(', ')
+      )
+      notify('background')
+    } else if (!active && alwaysOnNotified) {
+      alwaysOnNotified = false
+    }
+  } finally {
+    polling = false
   }
 }
 
 function startMeetingDetector(): void {
   if (!config.meetings.detect || meetingTimer) return
-  meetingActive = false
-  meetingTimer = setInterval(() => void pollMeeting(), 5000)
+  meetingSig = ''
+  alwaysOnNotified = false
+  // Meeting starts are not sub-15s-critical; 15s keeps tasklist/source polling
+  // cheap. pollMeeting() ignores a tick that arrives while the previous is live.
+  meetingTimer = setInterval(() => void pollMeeting(), 15_000)
   void pollMeeting()
 }
 
 function stopMeetingDetector(): void {
   if (meetingTimer) clearInterval(meetingTimer)
   meetingTimer = null
-  meetingActive = false
+  meetingSig = ''
+  alwaysOnNotified = false
 }
 
 function applyMeetingConfig(): void {
@@ -1415,7 +2387,13 @@ function registerDisplayMedia(): void {
     { useSystemPicker: false }
   )
 
-  session.defaultSession.setPermissionRequestHandler((_wc, _permission, cb) => cb(true))
+  // Only the media permission is needed: getUserMedia for the optional "You"
+  // channel and getDisplayMedia for loopback system audio. clipboard-sanitized-
+  // write covers the Copy buttons without granting clipboard reads. Deny
+  // everything else rather than blanket-granting every Electron permission.
+  session.defaultSession.setPermissionRequestHandler((_wc, permission, cb) =>
+    cb(permission === 'media' || permission === 'clipboard-sanitized-write')
+  )
 }
 
 const gotSingleInstanceLock = app.requestSingleInstanceLock()
@@ -1435,7 +2413,14 @@ if (!gotSingleInstanceLock) {
     config = loadConfig()
     const redacted = {
       ...config,
-      llm: { ...config.llm, apiKey: config.llm.apiKey ? '***' : '' },
+      llm: {
+        ...config.llm,
+        apiKey: config.llm.apiKey ? '***' : '',
+        profiles: config.llm.profiles.map((profile) => ({
+          ...profile,
+          apiKey: profile.apiKey ? '***' : ''
+        }))
+      },
       asr: { ...config.asr, apiKey: config.asr.apiKey ? '***' : '' }
     }
     console.log('[config]', JSON.stringify(redacted))
@@ -1445,6 +2430,7 @@ if (!gotSingleInstanceLock) {
     console.log('[boot] ipc ready')
     createWindow()
     console.log('[boot] window created')
+    runPdfTestHook()
     createTray()
     applyMeetingConfig()
     setupUpdates()
@@ -1458,6 +2444,11 @@ if (!gotSingleInstanceLock) {
     })
   })
 }
+
+app.on('before-quit', (e) => {
+  if (guardQuit()) return
+  e.preventDefault()
+})
 
 app.on('will-quit', () => {
   globalShortcut.unregisterAll()

@@ -2,21 +2,29 @@ import { contextBridge, ipcRenderer } from 'electron'
 import type { AppConfig, CaptureTestReport, ChatRequest, HotkeyInfo } from '../shared/types'
 
 const api = {
-  getConfig: (): Promise<AppConfig> => ipcRenderer.invoke('config:get'),
+  getConfig: (): Promise<{ config: AppConfig; corruptBackupPath: string | null }> =>
+    ipcRenderer.invoke('config:get'),
   setConfig: (patch: Partial<AppConfig>): Promise<AppConfig> =>
     ipcRenderer.invoke('config:set', patch),
-  setIgnoreMouse: (value: boolean): Promise<AppConfig> =>
-    ipcRenderer.invoke('win:set-ignore-mouse', value),
-  setPrivateMode: (value: boolean): Promise<AppConfig> =>
-    ipcRenderer.invoke('win:set-private-mode', value),
   hideWindow: (): Promise<void> => ipcRenderer.invoke('win:hide'),
   quit: (): Promise<void> => ipcRenderer.invoke('win:quit'),
-  appInfo: (): Promise<{ version: string; platform: string; configPath: string }> =>
-    ipcRenderer.invoke('app:info'),
+  // Save-before-quit handshake: ack on end-session receipt, then quit once saved.
+  ackEndSession: (): Promise<void> => ipcRenderer.invoke('app:end-session-ack'),
+  quitAfterSave: (): Promise<void> => ipcRenderer.invoke('app:quit-after-save'),
+  setCaptureListening: (value: boolean): Promise<void> =>
+    ipcRenderer.invoke('capture:set-listening', value),
   getHotkeys: (): Promise<HotkeyInfo[]> => ipcRenderer.invoke('hotkeys:list'),
-  saveSession: (payload: unknown): Promise<string | null> =>
-    ipcRenderer.invoke('session:save', payload),
-  captureScreen: (): Promise<string> => ipcRenderer.invoke('shot:capture'),
+  saveSession: (payload: unknown, opts?: { autosave?: boolean }): Promise<string | null> =>
+    ipcRenderer.invoke('session:save', payload, opts),
+  extractPdf: (): Promise<{
+    text: string
+    pagesProcessed: number
+    truncated: boolean
+  } | null> => ipcRenderer.invoke('docs:extract-pdf'),
+  fetchJob: (url: string): Promise<{ title: string; text: string }> =>
+    ipcRenderer.invoke('jobs:fetch', url),
+  captureScreen: (): Promise<{ dataUrl: string; hint?: string }> =>
+    ipcRenderer.invoke('shot:capture'),
   captureRegionSource: (): Promise<{ dataUrl: string; displayId: number }> =>
     ipcRenderer.invoke('shot:capture-source'),
   transcribe: (wav: ArrayBuffer, prompt?: string): Promise<{ text: string }> =>
@@ -26,13 +34,16 @@ const api = {
   testLlm: (): Promise<{ ok: boolean; text?: string; error?: string }> =>
     ipcRenderer.invoke('test:llm'),
   testCapture: (): Promise<CaptureTestReport> => ipcRenderer.invoke('test:capture'),
-  listDisplays: (): Promise<
-    Array<{ id: number; label: string; primary: boolean; bounds: { x: number; y: number; width: number; height: number } }>
-  > => ipcRenderer.invoke('displays:list'),
   moveToCursorDisplay: (): Promise<boolean> => ipcRenderer.invoke('displays:move-to-cursor'),
-  moveToDisplay: (index: number): Promise<boolean> => ipcRenderer.invoke('displays:move-to-index', index),
   listSessions: (): Promise<
-    Array<{ name: string; title: string; endedAt: string | null; segments: number; answers: number }>
+    Array<{
+      name: string
+      title: string
+      company: string
+      endedAt: string | null
+      segments: number
+      answers: number
+    }>
   > => ipcRenderer.invoke('sessions:list'),
   getSession: (name: string): Promise<unknown> => ipcRenderer.invoke('sessions:get', name),
   deleteSession: (name: string): Promise<boolean> => ipcRenderer.invoke('sessions:delete', name),

@@ -7,6 +7,84 @@ const MAX_CHUNK_MS = 12000
 const MAX_PREROLL_MS = 900
 const PARTIAL_INTERVAL_MS = 800
 const MIN_PARTIAL_SPEECH_MS = 900
+// 300 ms at 16 kHz: tolerate normal callback jitter, bridge longer stalls.
+const GAP_TOLERANCE_SAMPLES = 4800
+// Never synthesize more than 2 s in one burst; resync instead (see process()).
+const MAX_INJECTED_GAP_SAMPLES = 32000
+// Capture frames: 160 samples = 10 ms at the 16 kHz context.
+const WORKLET_FRAME_SAMPLES = 160
+const WORKLET_PROCESSOR_NAME = 'parakeet-vad-framer'
+// Samples per callback on the legacy path. Worklet frames are accumulated back
+// up to this size so the VAD cadence stays identical to the ScriptProcessor era.
+const SCRIPT_PROCESSOR_FRAME = 4096
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
+}
+
+// The worklet is a static asset, not bundled: electron-vite copies
+// renderer/public/* to the renderer output root. Resolving it against
+// location.href yields http://localhost:5173/vad-worklet.js in dev (vite serves
+// public/ at the dev server root) and file://.../out/renderer/vad-worklet.js
+// when packaged (main loads index.html from that same directory via loadFile,
+// and Electron's file loader reads inside the asar).
+function workletModuleUrl(): string {
+  return new URL('vad-worklet.js', window.location.href).href
+}
+
+/**
+ * Worklet preference from config.json through the existing renderer -> main
+ * channel. Tolerant: only an explicit `false` disables the worklet, so a
+ * missing key, a hand-edited non-boolean or a failed IPC read keeps the modern
+ * path (and the automatic fallback still guards a real load failure).
+ */
+async function workletEnabled(): Promise<boolean> {
+  try {
+    const { config } = await window.api.getConfig()
+    return config.audio?.useWorklet !== false
+  } catch (err) {
+    console.warn('[audio] worklet config read failed; assuming enabled:', err)
+    return true
+  }
+}
+
+/** Loads the framer module into one context. Logs the outcome either way. */
+async function loadWorkletModule(ctx: BaseAudioContext): Promise<boolean> {
+  if (!(await workletEnabled())) {
+    console.log(
+      '[audio] worklet module unavailable — falling back to ScriptProcessor: disabled by config'
+    )
+    return false
+  }
+  try {
+    await ctx.audioWorklet.addModule(workletModuleUrl())
+    console.log('[audio] worklet module loaded')
+    return true
+  } catch (err) {
+    console.log(
+      `[audio] worklet module unavailable — falling back to ScriptProcessor: ${errorText(err)}`
+    )
+    return false
+  }
+}
+
+// The engine is only built after getUserMedia succeeds, so without this probe a
+// device-less boot would never report the worklet outcome. One suspended
+// context is opened and closed immediately; nothing is connected or played.
+async function probeWorkletAtBoot(): Promise<void> {
+  try {
+    const probe = new AudioContext({ sampleRate: TARGET_SAMPLE_RATE })
+    try {
+      await loadWorkletModule(probe)
+    } finally {
+      void probe.close()
+    }
+  } catch (err) {
+    console.log(
+      `[audio] worklet module unavailable — falling back to ScriptProcessor: ${errorText(err)}`
+    )
+  }
+}
 
 function encodeWav(chunks: Float32Array[]): ArrayBuffer {
   let length = 0
@@ -45,9 +123,13 @@ export class AudioEngine {
   private ctx: AudioContext | null = null
   private source: MediaStreamAudioSourceNode | null = null
   private processor: ScriptProcessorNode | null = null
+  private worklet: AudioWorkletNode | null = null
   private sink: GainNode | null = null
   private stream: MediaStream | null = null
   private frames: Float32Array[] = []
+  // Worklet frames awaiting a full legacy-sized batch (see handleWorkletFrame).
+  private pendingFrames: Float32Array[] = []
+  private pendingSamples = 0
   private preBuffer: Float32Array[] = []
   private preBufferSamples = 0
   private voicedStreak = 0
@@ -58,6 +140,15 @@ export class AudioEngine {
 
   private utteranceId = 0
   private lastPartialAt = 0
+
+  // Wall-clock sample accounting. Any lossy delivery path (ScriptProcessor
+  // callbacks paused under main-thread jank, or a jammed worklet port) can drop
+  // samples; bounded silence (the SilencePacer idea) keeps VAD and silence
+  // timing true to elapsed time instead of stretching an utterance. With the
+  // AudioWorklet path this is a safety net that should almost never trigger.
+  private clockStart = 0
+  private expectedSamples = 0
+  private receivedSamples = 0
 
   constructor(
     private readonly speaker: Speaker,
@@ -73,24 +164,84 @@ export class AudioEngine {
     this.stream = stream
 
     const ctx = new AudioContext({ sampleRate: TARGET_SAMPLE_RATE, latencyHint: 'interactive' })
+    // Context first, then the module: a load failure only downgrades this
+    // stream, and the compile finishes before the first buffer arrives.
+    const workletReady = await loadWorkletModule(ctx)
     await ctx.resume()
     const source = ctx.createMediaStreamSource(new MediaStream([track]))
-    const processor = ctx.createScriptProcessor(4096, 1, 1)
     const sink = ctx.createGain()
     sink.gain.value = 0
 
-    processor.onaudioprocess = (event): void => {
-      this.process(event.inputBuffer.getChannelData(0))
+    let worklet: AudioWorkletNode | null = null
+    if (workletReady) {
+      try {
+        const node = new AudioWorkletNode(ctx, WORKLET_PROCESSOR_NAME, {
+          numberOfInputs: 1,
+          numberOfOutputs: 1,
+          channelCount: 1,
+          channelCountMode: 'explicit',
+          channelInterpretation: 'speakers',
+          processorOptions: { frameSize: WORKLET_FRAME_SAMPLES }
+        })
+        node.port.onmessage = (event: MessageEvent): void => {
+          this.handleWorkletFrame(event.data as Float32Array)
+        }
+        source.connect(node)
+        node.connect(sink)
+        worklet = node
+      } catch (err) {
+        console.log(
+          `[audio] worklet module unavailable — falling back to ScriptProcessor: ${errorText(err)}`
+        )
+        worklet = null
+      }
     }
 
-    source.connect(processor)
-    processor.connect(sink)
+    if (!worklet) {
+      // Legacy safety hatch: untouched behaviour, just reachable only when the
+      // module could not be loaded (or config.audio.useWorklet === false).
+      const processor = ctx.createScriptProcessor(SCRIPT_PROCESSOR_FRAME, 1, 1)
+
+      processor.onaudioprocess = (event): void => {
+        this.process(event.inputBuffer.getChannelData(0))
+      }
+
+      source.connect(processor)
+      processor.connect(sink)
+      this.processor = processor
+    }
+
+    // Silent tail on both paths: the destination pulls the graph, the worklet
+    // writes no output samples and the sink gain is 0.
     sink.connect(ctx.destination)
 
     this.ctx = ctx
     this.source = source
-    this.processor = processor
+    this.worklet = worklet
     this.sink = sink
+  }
+
+  /**
+   * Worklet frames arrive as 10 ms transferables. Batching back up to the
+   * legacy 4096-sample callbacks keeps VAD cadence, partial timing and gap
+   * accounting bit-for-bit identical to the ScriptProcessor path (process()
+   * itself is size-agnostic, but batching avoids 25x more VAD updates).
+   */
+  private handleWorkletFrame(frame: Float32Array): void {
+    if (frame.length === 0) return
+    this.pendingFrames.push(frame)
+    this.pendingSamples += frame.length
+    if (this.pendingSamples < SCRIPT_PROCESSOR_FRAME) return
+
+    const batch = new Float32Array(this.pendingSamples)
+    let offset = 0
+    for (const part of this.pendingFrames) {
+      batch.set(part, offset)
+      offset += part.length
+    }
+    this.pendingFrames = []
+    this.pendingSamples = 0
+    this.process(batch)
   }
 
   private push(data: Float32Array): void {
@@ -100,6 +251,27 @@ export class AudioEngine {
 
   private process(data: Float32Array): void {
     const now = performance.now()
+    if (!this.clockStart) {
+      // Anchor to the start of the first buffer so its samples are not a gap.
+      this.clockStart = now - (data.length / TARGET_SAMPLE_RATE) * 1000
+    }
+    this.expectedSamples = Math.round(
+      ((now - this.clockStart) / 1000) * TARGET_SAMPLE_RATE
+    )
+    this.receivedSamples += data.length
+    const gap = this.expectedSamples - this.receivedSamples
+    if (gap > GAP_TOLERANCE_SAMPLES) {
+      this.receivedSamples = this.expectedSamples
+      // Zero samples only matter inside an utterance (silence/VAD timing).
+      // When idle, or after a multi-second stall, just resync the baseline.
+      if (this.speaking && gap <= MAX_INJECTED_GAP_SAMPLES) {
+        this.feed(new Float32Array(gap), now)
+      }
+    }
+    this.feed(data, now)
+  }
+
+  private feed(data: Float32Array, now: number): void {
     let sum = 0
     for (let i = 0; i < data.length; i++) sum += data[i] * data[i]
     const rms = Math.sqrt(sum / data.length)
@@ -189,6 +361,13 @@ export class AudioEngine {
 
   stop(): void {
     try {
+      if (this.worklet) {
+        // Clear the audio-thread buffer, mute further posts, then detach.
+        this.worklet.port.postMessage('reset')
+        this.worklet.port.postMessage('stop')
+        this.worklet.port.onmessage = null
+        this.worklet.disconnect()
+      }
       this.processor?.disconnect()
       this.source?.disconnect()
       this.sink?.disconnect()
@@ -200,14 +379,20 @@ export class AudioEngine {
     this.ctx = null
     this.source = null
     this.processor = null
+    this.worklet = null
     this.sink = null
     this.stream = null
     this.frames = []
+    this.pendingFrames = []
+    this.pendingSamples = 0
     this.preBuffer = []
     this.preBufferSamples = 0
     this.speechMs = 0
     this.voicedStreak = 0
     this.speaking = false
+    this.clockStart = 0
+    this.expectedSamples = 0
+    this.receivedSamples = 0
   }
 }
 
@@ -235,3 +420,7 @@ export async function startSystemStream(): Promise<MediaStream> {
   stream.getVideoTracks().forEach((t) => t.stop())
   return audioOnly
 }
+
+// Runs when the renderer bundle loads (App imports this module at startup), so
+// the module outcome is logged even if no microphone or loopback device exists.
+void probeWorkletAtBoot()

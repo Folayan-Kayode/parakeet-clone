@@ -1,12 +1,24 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ChangeEvent, PointerEvent as ReactPointerEvent } from 'react'
 import type {
+  AnswerStyle,
   AppConfig,
   CaptureTestCheck,
   CaptureTestReport,
   ChatMessage,
-  HotkeyInfo
+  EffortSetting,
+  HotkeyInfo,
+  ModelCatalogEntry,
+  ModelProfile,
+  QuestionType,
+  ResolvedQuestionType,
+  SpeedBadge
 } from '../../shared/types'
+import { MODEL_CATALOG } from '../../shared/types'
+import {
+  parseStructuredAnswerText as parseStructuredAnswer,
+  type StructuredAnswer
+} from '../../shared/structuredAnswer'
 import {
   AudioEngine,
   startMicStream,
@@ -31,6 +43,10 @@ interface Answer {
   transcript?: string
   /** id of the transcript segment this answer responds to ("final-Them-<uid>") */
   anchorId?: string
+  /** Parsed card; absent when the model ignored the contract (raw fallback). */
+  card?: StructuredAnswer
+  /** Screenshot data URLs sent with this ask (capped when saved). */
+  images?: string[]
 }
 
 function clip(text: string, max: number): string {
@@ -38,7 +54,249 @@ function clip(text: string, max: number): string {
   return t.length > max ? `${t.slice(0, max)}…` : t
 }
 
-function buildSystemPrompt(cfg: AppConfig, hasImageAttachment: boolean): string {
+const QUESTION_TYPE_LABELS: Record<QuestionType, string> = {
+  auto: 'Auto',
+  behavioral: 'Behavioral',
+  coding: 'Coding',
+  'system-design': 'System design',
+  experience: 'Experience check',
+  technical: 'Technical knowledge',
+  other: 'Other'
+}
+
+const QUESTION_TYPE_OPTIONS: ResolvedQuestionType[] = [
+  'behavioral',
+  'coding',
+  'system-design',
+  'experience',
+  'technical',
+  'other'
+]
+
+// Same intent as the main process CODE_RE, widened just enough for spoken questions.
+const CODING_GUESS_RE =
+  /\b(algorithm|complexity|optimi[sz]e|dynamic programming|data structure|binary search|recursion|two pointers|sliding window|implement|write (a|the) (function|method|program)|leetcode|array|linked list|hash ?map|stack|queue|binary tree|graph|big.?o)\b/i
+
+const BEHAVIORAL_GUESS_RE =
+  /\b(tell me about a time|describe a (situation|time|challenge)|give me an example|conflict|disagree|teamwork|worked (with|on a team)|challenge|failure|mistake|proud of|strength|weakness|leadership|deadline|under pressure|went wrong|difficult (person|situation))\b/i
+
+const BEHAVIORAL_OPENER_RE = /^\s*(tell me about (a time|yourself)|describe (a time|a situation))/i
+
+function guessQuestionType(text: string): ResolvedQuestionType {
+  // A story-style opener wins even when it mentions a coding verb ("...implement a change").
+  if (BEHAVIORAL_OPENER_RE.test(text)) return 'behavioral'
+  if (CODING_GUESS_RE.test(text)) return 'coding'
+  if (BEHAVIORAL_GUESS_RE.test(text)) return 'behavioral'
+  return 'other'
+}
+
+function resolveQuestionType(setting: QuestionType, text: string): ResolvedQuestionType {
+  return setting === 'auto' ? guessQuestionType(text) : setting
+}
+
+// Static preview corpus: shaped by the live style draft, never sent anywhere.
+// Rough word targets: concise ~45, balanced ~85, detailed ~140.
+function sampleBehavioral(a: AnswerStyle): string {
+  const story = [
+    'At my last company our checkout p95 doubled a week before launch',
+    'I owned the rollout and had to recover latency without moving the date',
+    'I profiled the hot path, split a blocking write, and paired with the on-call engineer on a bounded cache',
+    'As a result, p95 fell under 200 ms and we shipped on time with no rollbacks',
+    'The lesson was to measure first and keep the fix small'
+  ]
+  let beats: string[]
+  if (a.star) {
+    beats =
+      a.length === 'concise'
+        ? [story[0], story[2], story[3]]
+        : a.length === 'detailed'
+          ? story
+          : story.slice(0, 4)
+  } else {
+    beats =
+      a.length === 'concise'
+        ? [story[0], story[2]]
+        : a.length === 'detailed'
+          ? [...story.slice(0, 3), story[4]]
+          : story.slice(0, 3)
+  }
+  if (a.tone === 'simple') {
+    beats = beats.map((beat) => beat.replace('profiled the hot path', 'checked where the time went'))
+  }
+  const lines = beats.map((beat) => `${beat}.`)
+  if (a.tone === 'casual') {
+    lines[0] = `So, ${lines[0].charAt(0).toLowerCase()}${lines[0].slice(1)} you know?`
+  }
+  if (a.fillerWords && a.tone !== 'casual') {
+    lines.splice(1, 0, 'Honestly, that week was intense.')
+  }
+  if (a.format === 'bullets') return lines.map((line) => `• ${line}`).join('\n')
+  if (a.format === 'balanced') {
+    const split = Math.max(1, Math.ceil(lines.length / 2))
+    return `${lines.slice(0, split).join(' ')}\n\n${lines.slice(split).join(' ')}`
+  }
+  return lines.join(' ')
+}
+
+function sampleCoding(a: AnswerStyle): string {
+  const code: Record<AnswerStyle['codeLanguage'], string> = {
+    python:
+      'def two_sum(nums, target):\n    seen = {}\n    for i, n in enumerate(nums):\n        if target - n in seen:\n            return [seen[target - n], i]\n        seen[n] = i\n    return []',
+    javascript:
+      'function twoSum(nums, target) {\n  const seen = new Map()\n  for (let i = 0; i < nums.length; i++) {\n    const need = target - nums[i]\n    if (seen.has(need)) return [seen.get(need), i]\n    seen.set(nums[i], i)\n  }\n  return []\n}',
+    java:
+      'int[] twoSum(int[] nums, int target) {\n    Map<Integer, Integer> seen = new HashMap<>();\n    for (int i = 0; i < nums.length; i++) {\n        int need = target - nums[i];\n        if (seen.containsKey(need)) return new int[]{seen.get(need), i};\n        seen.put(nums[i], i);\n    }\n    return new int[]{};\n}',
+    cpp:
+      'vector<int> twoSum(vector<int>& nums, int target) {\n    unordered_map<int, int> seen;\n    for (int i = 0; i < nums.size(); i++) {\n        int need = target - nums[i];\n        if (seen.count(need)) return {seen[need], i};\n        seen[nums[i]] = i;\n    }\n    return {};\n}'
+  }
+  const approach =
+    a.tone === 'casual'
+      ? "So, I'd scan the array once, stash each value's index, and look for the complement — you know, the classic one-pass hash map."
+      : 'I would scan the array once, store each value and index in a hash map, and check for the complement at every step.'
+  const steps = [
+    'Create a map from value to index.',
+    'For each element, check whether target - value is already in the map.',
+    'If it is, return both indices; otherwise store the current index.',
+    'Return an empty result when no pair exists.'
+  ]
+  const stepText =
+    a.format === 'paragraph'
+      ? steps.map((step, i) => `${i + 1}. ${step}`).join(' ')
+      : steps.map((step, i) => `${i + 1}. ${step}`).join('\n')
+  const filler = a.fillerWords && a.tone !== 'formal' ? ' Honestly, that keeps it linear.' : ''
+  return `${approach}${filler}\n\n${stepText}\n\n${code[a.codeLanguage]}\n\nTime complexity: O(n). Space complexity: O(n).`
+}
+
+function structuredAnswerText(card: StructuredAnswer): string {
+  const parts: string[] = []
+  if (card.approach) parts.push(card.approach)
+  if (card.keySteps.length > 0) {
+    parts.push(card.keySteps.map((step, index) => `${index + 1}. ${step}`).join('\n'))
+  }
+  if (card.code.source) {
+    parts.push(`\`\`\`${card.code.language}\n${card.code.source}\n\`\`\``)
+  }
+  const complexity = [
+    card.complexity.time && `time ${card.complexity.time}`,
+    card.complexity.space && `space ${card.complexity.space}`
+  ].filter(Boolean)
+  if (complexity.length > 0) parts.push(`Complexity: ${complexity.join('; ')}`)
+  return parts.join('\n\n')
+}
+
+function StructuredAnswerCard({ card }: { card: StructuredAnswer }) {
+  return (
+    <div className="answer-card">
+      {card.approach && <div className="answer-approach">{card.approach}</div>}
+      {card.keySteps.length > 0 && (
+        <ol className="answer-steps">
+          {card.keySteps.map((step, index) => (
+            <li key={index}>{step}</li>
+          ))}
+        </ol>
+      )}
+      {card.code.source && (
+        <div className="answer-code">
+          <div className="answer-code-head">
+            <span className="mono">{card.code.language || 'code'}</span>
+            <button
+              className="copy"
+              title="Copy code"
+              onClick={() => void navigator.clipboard.writeText(card.code.source)}
+            >
+              Copy
+            </button>
+          </div>
+          <pre className="answer-code-body">{card.code.source}</pre>
+        </div>
+      )}
+      {(card.complexity.time || card.complexity.space) && (
+        <div className="answer-complexity">
+          {card.complexity.time && (
+            <span className="complexity-chip">Time {card.complexity.time}</span>
+          )}
+          {card.complexity.space && (
+            <span className="complexity-chip">Space {card.complexity.space}</span>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// Thread rows are memoized on the immutable per-entry objects. A streaming
+// answer replaces only its own object, so every other row skips re-rendering.
+const SegmentRow = memo(function SegmentRow({ segment }: { segment: Segment }) {
+  return (
+    <div className={`seg${segment.partial ? ' partial' : ''}`}>
+      <span className={`speaker ${segment.speaker === 'You' ? 'you' : 'them'}`}>
+        {segment.speaker}
+      </span>
+      <span className="seg-text">
+        {segment.text}
+        {segment.partial ? ' …' : ''}
+      </span>
+    </div>
+  )
+})
+
+interface AnswerRowProps {
+  answer: Answer
+  onRegenerate: (answer: Answer) => void
+  onStop: (id: string) => void
+}
+
+const AnswerRow = memo(function AnswerRow({ answer, onRegenerate, onStop }: AnswerRowProps) {
+  return (
+    <div className="answer">
+      <div className="answer-head">
+        <span className="speaker answer-tag">Answer</span>
+        {answer.streaming && <span className="streaming">…</span>}
+        {answer.card && <span className="answer-kind">coded</span>}
+        <div className="answer-actions">
+          {answer.streaming && (
+            <button
+              className="copy"
+              title="Stop generating"
+              onClick={() => onStop(answer.id)}
+            >
+              ✕
+            </button>
+          )}
+          {!answer.streaming && !answer.error && (
+            <button className="copy" onClick={() => onRegenerate(answer)}>
+              Regenerate
+            </button>
+          )}
+          <button
+            className="copy"
+            title="Copy"
+            onClick={() =>
+              void navigator.clipboard.writeText(
+                answer.card ? structuredAnswerText(answer.card) : answer.text
+              )
+            }
+          >
+            Copy
+          </button>
+        </div>
+      </div>
+      {answer.error ? (
+        <div className="answer-error">{answer.error}</div>
+      ) : answer.card ? (
+        <StructuredAnswerCard card={answer.card} />
+      ) : (
+        <div className="answer-text">{answer.text || (answer.streaming ? '' : '—')}</div>
+      )}
+    </div>
+  )
+})
+
+function buildSystemPrompt(
+  cfg: AppConfig,
+  hasImageAttachment: boolean,
+  qType: ResolvedQuestionType
+): string {
   const a = cfg.answer
   const lengthRule =
     a.length === 'concise'
@@ -58,16 +316,18 @@ function buildSystemPrompt(cfg: AppConfig, hasImageAttachment: boolean): string 
       : a.tone === 'simple'
         ? 'Use plain, simple language.'
         : 'Use a professional, composed tone.'
-  const starRule = a.star
-    ? 'For behavioral questions, structure the answer as STAR (Situation, Task, Action, Result) without labeling the parts aloud.'
-    : ''
+  const starRule =
+    a.star || qType === 'behavioral'
+      ? 'For behavioral questions, structure the answer as STAR (Situation, Task, Action, Result) without labeling the parts aloud.'
+      : ''
   const fillerRule = a.fillerWords
     ? 'Include light, natural spoken fillers ("honestly", "so", "you know") sparingly, no more than once or twice.'
     : 'Avoid filler words; speak crisply.'
 
   const profile = [
-    cfg.profile.background.trim() && `Candidate background:\n${clip(cfg.profile.background, 2000)}`,
-    cfg.profile.resume.trim() && `Resume (factual source for the candidate):\n${clip(cfg.profile.resume, 8000)}`
+    cfg.profile.background.trim() && `Candidate background:\n${clip(cfg.profile.background, 20000)}`,
+    cfg.profile.resume.trim() &&
+      `Resume (factual source for the candidate):\n${clip(cfg.profile.resume, 30000)}`
   ]
     .filter(Boolean)
     .join('\n\n')
@@ -75,9 +335,9 @@ function buildSystemPrompt(cfg: AppConfig, hasImageAttachment: boolean): string 
   const session = [
     cfg.session.company.trim() && `Company: ${cfg.session.company.trim()}`,
     cfg.session.jobDescription.trim() &&
-      `Job description:\n${clip(cfg.session.jobDescription, 4000)}`,
+      `Job description:\n${clip(cfg.session.jobDescription, 10000)}`,
     cfg.session.extraContext.trim() &&
-      `Extra instructions:\n${clip(cfg.session.extraContext, 2000)}`
+      `Extra instructions:\n${clip(cfg.session.extraContext, 20000)}`
   ]
     .filter(Boolean)
     .join('\n\n')
@@ -86,13 +346,21 @@ function buildSystemPrompt(cfg: AppConfig, hasImageAttachment: boolean): string 
   // screenshots. Kept last so it is the most recent instruction; the global
   // rules above (first person, never mention being an AI) still apply.
   const imageRule = hasImageAttachment
-    ? [
-        'An image is attached to this question. Read it completely before answering.',
-        `- If the image contains a programming/coding problem: open with at most a 1-2 sentence first-person approach summary (spoken style), then IMMEDIATELY give the complete, correct, runnable solution in ONE code block in ${a.codeLanguage}. No trailing questions, no "want me to..." offers, no meta commentary, no restating the problem. If the approach is trivial, the code block can be the whole answer.`,
-        '- Else if the image is a multiple-choice question: state the selected answer (letter + text) FIRST, then at most one short line of justification.',
-        '- Else: fall back to the normal spoken-answer style.',
-        'These image rules take precedence over the Style word budget above.'
-      ].join('\n')
+    ? qType === 'coding'
+      ? [
+          'An image is attached to this question. Read it completely before answering.',
+          'This is a coding question. Respond with ONLY a JSON object and no other text, using exactly this shape:',
+          `{"approach": "<=2 sentence first-person approach", "key_steps": ["..."], "code": {"language": "${a.codeLanguage}", "source": "..."}, "complexity": {"time": "...", "space": "..."}}`,
+          `Fill "approach" with at most two spoken-style first-person sentences. "key_steps" lists the algorithm steps in order. "code.source" is the complete, correct, runnable ${a.codeLanguage} solution, with NO markdown fences inside the JSON string. "complexity" gives big-O time and space. No trailing questions, offers, or meta commentary.`,
+          'These image rules take precedence over the Style word budget above.'
+        ].join('\n')
+      : [
+          'An image is attached to this question. Read it completely before answering.',
+          `- If the image contains a programming/coding problem: open with at most a 1-2 sentence first-person approach summary (spoken style), then IMMEDIATELY give the complete, correct, runnable solution in ONE code block in ${a.codeLanguage}. No trailing questions, no "want me to..." offers, no meta commentary, no restating the problem. If the approach is trivial, the code block can be the whole answer.`,
+          '- Else if the image is a multiple-choice question: state the selected answer (letter + text) FIRST, then at most one short line of justification.',
+          '- Else: fall back to the normal spoken-answer style.',
+          'These image rules take precedence over the Style word budget above.'
+        ].join('\n')
     : ''
 
   return [
@@ -112,13 +380,47 @@ function buildSystemPrompt(cfg: AppConfig, hasImageAttachment: boolean): string 
     .join('\n')
 }
 
-const MAX_SEGMENTS = 200
+// In-memory render cap; sessions keep everything retained. Raised for long interviews.
+const MAX_SEGMENTS = 2000
+
+// Session JSON keeps only the most recent screenshots to bound file size.
+const MAX_SESSION_IMAGES = 10
 
 // Queued follow-ups older than this are stale for a live interview and dropped.
 const QUEUE_TTL_MS = 60_000
 
+// While listening, snapshot the live session so a crash/quit loses at most this.
+const AUTOSAVE_INTERVAL_MS = 120_000
+const AUTOSAVE_FILE_NAME = 'autosave.json'
+
+// Overall cap for letting in-flight finals land before End/quit saves.
+const CHAIN_DRAIN_TIMEOUT_MS = 4000
+
 function formatAccelerator(accelerator: string): string {
   return accelerator.replace(/CommandOrControl/g, 'Ctrl')
+}
+
+const BADGE_LABELS: Record<SpeedBadge, string> = {
+  recommended: 'Recommended',
+  fast: 'Fast',
+  slow: 'Slow',
+  'very-slow': 'Very slow'
+}
+
+function badgeLabel(badge: SpeedBadge): string {
+  return BADGE_LABELS[badge]
+}
+
+// Presets apply effort to the active profile; the legacy field is mirrored so
+// configs migrated later keep the same intent.
+function presetLlm(cfg: AppConfig, effort: 'low' | 'high'): AppConfig['llm'] {
+  return {
+    ...cfg.llm,
+    reasoningEffort: effort,
+    profiles: cfg.llm.profiles.map((profile) =>
+      profile.id === cfg.llm.activeProfileId ? { ...profile, effort } : profile
+    )
+  }
 }
 
 // Settings presets only patch the draft: the user still reviews and saves.
@@ -127,7 +429,7 @@ function applyPreset(cfg: AppConfig, preset: 'behavioral' | 'coding'): AppConfig
   if (preset === 'behavioral') {
     return {
       ...cfg,
-      llm: { ...cfg.llm, reasoningEffort: 'low' },
+      llm: presetLlm(cfg, 'low'),
       answer: {
         ...cfg.answer,
         length: 'balanced',
@@ -140,7 +442,7 @@ function applyPreset(cfg: AppConfig, preset: 'behavioral' | 'coding'): AppConfig
   }
   return {
     ...cfg,
-    llm: { ...cfg.llm, reasoningEffort: 'high' },
+    llm: presetLlm(cfg, 'high'),
     answer: {
       ...cfg.answer,
       length: 'concise',
@@ -275,11 +577,27 @@ function uid(): string {
     : Math.random().toString(36).slice(2)
 }
 
+interface SessionSummary {
+  name: string
+  title: string
+  company: string
+  endedAt: string | null
+  segments: number
+  answers: number
+}
+
 interface SessionData {
   title?: string
+  company?: string
   endedAt?: string
   segments?: Array<{ id?: string; speaker: string; text: string; ts: number }>
-  answers?: Array<{ text: string; error?: string; question?: string; anchorId?: string }>
+  answers?: Array<{
+    text: string
+    error?: string
+    question?: string
+    anchorId?: string
+    images?: string[]
+  }>
 }
 
 export default function App() {
@@ -296,22 +614,34 @@ export default function App() {
   const [title, setTitle] = useState('Interview session')
   const [company, setCompany] = useState('')
   const [jobDescription, setJobDescription] = useState('')
+  const [jobUrl, setJobUrl] = useState('')
+  const [jobFetching, setJobFetching] = useState(false)
   const [extraContext, setExtraContext] = useState('')
   const [resume, setResume] = useState('')
   const [background, setBackground] = useState('')
-  const [historyList, setHistoryList] = useState<
-    Array<{ name: string; title: string; endedAt: string | null; segments: number; answers: number }>
-  >([])
+  const [vocabulary, setVocabulary] = useState('')
+  const [historyList, setHistoryList] = useState<SessionSummary[]>([])
   const [historyDetail, setHistoryDetail] = useState<SessionData | null>(null)
   const [historyLoading, setHistoryLoading] = useState(false)
   const [pendingDelete, setPendingDelete] = useState<string | null>(null)
   const [pendingDeleteAll, setPendingDeleteAll] = useState(false)
+  const [pendingResumePdf, setPendingResumePdf] = useState<{
+    text: string
+    pagesProcessed: number
+    truncated: boolean
+  } | null>(null)
+  const [pendingJobReplaceUrl, setPendingJobReplaceUrl] = useState<string | null>(null)
+  const [asrWarning, setAsrWarning] = useState(false)
+  const [autosaveBannerDismissed, setAutosaveBannerDismissed] = useState(false)
+  const [corruptBackup, setCorruptBackup] = useState<string | null>(null)
+  const [corruptBannerDismissed, setCorruptBannerDismissed] = useState(false)
   const [updateReady, setUpdateReady] = useState<{ version: string } | null>(null)
   const [regionShot, setRegionShot] = useState<{ dataUrl: string; displayId: number } | null>(null)
   const [regionSel, setRegionSel] = useState<{ x: number; y: number; w: number; h: number } | null>(
     null
   )
   const [regionSaving, setRegionSaving] = useState(false)
+  const [modelMenuOpen, setModelMenuOpen] = useState(false)
 
   const engines = useRef<{ you?: AudioEngine; them?: AudioEngine } | null>(null)
   const chains = useRef<Record<Speaker, Promise<void>>>({ You: Promise.resolve(), Them: Promise.resolve() })
@@ -324,6 +654,9 @@ export default function App() {
     Them: { uid: -1, applied: 0, finalizing: false }
   })
   const streaming = useRef(false)
+  // Answers the user stopped: their abort rejection is a silent stop, not an error.
+  const abortedAnswers = useRef<Set<string>>(new Set())
+  const structuredAnswers = useRef<Set<string>>(new Set())
   const lastAnswerAt = useRef(0)
   const pendingAsks = useRef<Array<{ question: string; anchorUid: number; queuedAt: number }>>([])
   const askedUids = useRef<Set<number>>(new Set())
@@ -332,9 +665,22 @@ export default function App() {
   const answersRef = useRef<Answer[]>([])
   const promptRef = useRef<Record<Speaker, string>>({ You: '', Them: '' })
   const titleRef = useRef(title)
+  const companyRef = useRef(company)
+  const endRef = useRef<(thenQuit: boolean) => void>(() => undefined)
+  const asrFailures = useRef<Record<Speaker, number>>({ You: 0, Them: 0 })
+  const asrWarningDismissed = useRef(false)
+  // Set once the current session's transcript has been written for real; a
+  // later Quit/close must not save a duplicate.
+  const transcriptSavedRef = useRef(false)
+  // End is idempotent: a second concurrent call (End, then Alt+F4) returns
+  // immediately instead of snapshotting twice into two session files.
+  const endingSessionRef = useRef(false)
+  // A quit request that lands during an in-flight End still quits after it.
+  const endQuitPendingRef = useRef(false)
   const askRef = useRef<(question?: string, anchorUid?: number, useAttachments?: boolean) => void>(
     () => undefined
   )
+  const regenerateRef = useRef<(answer: Answer) => void>(() => undefined)
   const shotRef = useRef<() => void>(() => undefined)
   const beginRef = useRef<() => void>(() => undefined)
   const listeningRef = useRef(false)
@@ -344,10 +690,12 @@ export default function App() {
   const queueTimer = useRef<number | null>(null)
   const regionDrag = useRef<{ startX: number; startY: number; rect: DOMRect } | null>(null)
   const regionImgRef = useRef<HTMLImageElement | null>(null)
+  const modelSwitchRef = useRef<HTMLDivElement | null>(null)
   const toastTimer = useRef<number | null>(null)
 
   configRef.current = config
   titleRef.current = title
+  companyRef.current = company
   answersRef.current = answers
   listeningRef.current = listening
 
@@ -357,28 +705,65 @@ export default function App() {
     toastTimer.current = window.setTimeout(() => setToast(null), 2600)
   }, [])
 
+  const loadHistory = useCallback(async () => {
+    setHistoryLoading(true)
+    try {
+      setHistoryList(await window.api.listSessions())
+    } catch {
+      setHistoryList([])
+    } finally {
+      setHistoryLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    void loadHistory()
+  }, [loadHistory])
+
   useEffect(() => {
     void (async () => {
-      const loaded = await window.api.getConfig()
+      const { config: loaded, corruptBackupPath } = await window.api.getConfig()
       setConfig(loaded)
+      setCorruptBackup(corruptBackupPath)
       setTitle(loaded.session.title || 'Interview session')
       setCompany(loaded.session.company)
       setJobDescription(loaded.session.jobDescription)
       setExtraContext(loaded.session.extraContext)
       setResume(loaded.profile.resume)
       setBackground(loaded.profile.background)
+      setVocabulary(loaded.profile.vocabulary)
     })()
   }, [])
 
   useEffect(() => {
     const offConfig = window.api.onConfigChanged((next) => setConfig(next))
     const offDelta = window.api.onLlmDelta(({ id, text }) => {
-      setAnswers((prev) => prev.map((a) => (a.id === id ? { ...a, text: a.text + text } : a)))
+      setAnswers((prev) =>
+        prev.map((a) => {
+          if (a.id !== id) return a
+          const nextText = a.text + text
+          if (structuredAnswers.current.has(id)) {
+            const card = parseStructuredAnswer(nextText)
+            if (card) return { ...a, text: nextText, card }
+          }
+          return { ...a, text: nextText }
+        })
+      )
     })
     const offDone = window.api.onLlmDone(({ id }) => {
+      structuredAnswers.current.delete(id)
       setAnswers((prev) => prev.map((a) => (a.id === id ? { ...a, streaming: false } : a)))
     })
     const offError = window.api.onLlmError(({ id, message }) => {
+      structuredAnswers.current.delete(id)
+      // A user-initiated stop clears streaming silently instead of raising a
+      // scary abort banner. Main still sends llm:error for the aborted request.
+      // The id is not removed: the invoke rejection can be delivered before or
+      // after this event, and the set is bounded by manual stops per run.
+      if (abortedAnswers.current.has(id)) {
+        setAnswers((prev) => prev.map((a) => (a.id === id ? { ...a, streaming: false } : a)))
+        return
+      }
       setAnswers((prev) =>
         prev.map((a) => (a.id === id ? { ...a, streaming: false, error: message } : a))
       )
@@ -399,6 +784,8 @@ export default function App() {
       if (name === 'chat') composerRef.current?.focus()
       if (name === 'settings') setView('settings')
       if (name === 'autostart' && !listeningRef.current) beginRef.current()
+      // Main asks for this on close/quit: save, then call quitAfterSave().
+      if (name === 'end-session') endRef.current(true)
     })
     return off
   }, [])
@@ -407,6 +794,24 @@ export default function App() {
     const off = window.api.onUpdateReady((payload) => setUpdateReady(payload))
     return off
   }, [])
+
+  // Dismiss the profile menu on an outside pointerdown or Escape.
+  useEffect(() => {
+    if (!modelMenuOpen) return
+    const onPointerDown = (event: PointerEvent): void => {
+      if (modelSwitchRef.current?.contains(event.target as Node)) return
+      setModelMenuOpen(false)
+    }
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') setModelMenuOpen(false)
+    }
+    document.addEventListener('pointerdown', onPointerDown)
+    document.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown)
+      document.removeEventListener('keydown', onKeyDown)
+    }
+  }, [modelMenuOpen])
 
   // Sticky-bottom: follow new content only while the reader is already at the
   // bottom; scrolling up pauses following until they return to the bottom.
@@ -427,22 +832,39 @@ export default function App() {
 
   useEffect(() => {
     if (view !== 'history') return
-    void (async () => {
-      setHistoryLoading(true)
-      try {
-        setHistoryList(await window.api.listSessions())
-      } catch {
-        setHistoryList([])
-      } finally {
-        setHistoryLoading(false)
-      }
-    })()
+    void loadHistory()
+  }, [view, loadHistory])
+
+  // Company suggestions from previously saved sessions (unique, non-empty).
+  const companyOptions = useMemo(() => {
+    const seen = new Set<string>()
+    const out: string[] = []
+    for (const session of historyList) {
+      const value = session.company.trim()
+      if (!value) continue
+      const key = value.toLowerCase()
+      if (seen.has(key)) continue
+      seen.add(key)
+      out.push(value)
+    }
+    return out.sort((a, b) => a.localeCompare(b))
+  }, [historyList])
+
+  // Autosave slot is a normal session file; offer recovery until History is seen.
+  const autosaveAvailable = useMemo(
+    () => historyList.some((session) => session.name === AUTOSAVE_FILE_NAME),
+    [historyList]
+  )
+
+  useEffect(() => {
+    if (view === 'history') setAutosaveBannerDismissed(true)
   }, [view])
 
   useEffect(() => {
     return () => {
       engines.current?.you?.stop()
       engines.current?.them?.stop()
+      void window.api.setCaptureListening(false).catch(() => undefined)
       if (queueTimer.current) window.clearTimeout(queueTimer.current)
     }
   }, [])
@@ -555,6 +977,27 @@ export default function App() {
     [queueAsk]
   )
 
+  // Whisper initial_prompt: company + vocabulary first, then the recent
+  // transcript carry-over in the remaining budget.
+  // OpenAI whisper-1 prompt limit is 224 tokens; 700 chars is safe headroom.
+  const whisperPrompt = useCallback((speaker: Speaker): string => {
+    const carry = promptRef.current[speaker]
+    const cfg = configRef.current
+    const company = (cfg?.session.company ?? '').replace(/\s+/g, ' ').trim()
+    const vocabulary = (cfg?.profile.vocabulary ?? '').replace(/\s+/g, ' ').trim()
+    const prefix = [
+      company && `Company: ${company}.`,
+      vocabulary && `Terms: ${vocabulary}.`
+    ]
+      .filter(Boolean)
+      .join(' ')
+    if (!prefix) return carry
+    const budget = 700
+    const clipped = prefix.slice(0, budget)
+    const room = Math.max(0, budget - clipped.length - 1)
+    return `${clipped}${room > 0 && carry ? ` ${carry.slice(-room)}` : ''}`.slice(0, budget)
+  }, [])
+
   const handlePartial = useCallback(
     (speaker: Speaker, wav: ArrayBuffer, uid: number) => {
       if (!configRef.current?.interaction.streamingPartials) return
@@ -565,7 +1008,7 @@ export default function App() {
       info.uid = uid
       info.finalizing = false
       window.api
-        .transcribe(wav, promptRef.current[speaker])
+        .transcribe(wav, whisperPrompt(speaker))
         .then(({ text }) => {
           const clean = text.trim()
           const cur = partialInfo.current[speaker]
@@ -613,7 +1056,7 @@ export default function App() {
           partialBusy.current[speaker] = false
         })
     },
-    [queueAsk]
+    [queueAsk, whisperPrompt]
   )
 
   const onWav = useCallback(
@@ -624,7 +1067,10 @@ export default function App() {
       info.finalizing = true
       chains.current[speaker] = chains.current[speaker]
         .then(async () => {
-          const { text } = await window.api.transcribe(wav, promptRef.current[speaker])
+          const { text } = await window.api.transcribe(wav, whisperPrompt(speaker))
+          asrFailures.current[speaker] = 0
+          asrWarningDismissed.current = false
+          setAsrWarning(false)
           if (!text.trim()) {
             removePartial(partialId)
             return
@@ -632,6 +1078,10 @@ export default function App() {
           appendSegment(speaker, text, partialId, uid)
         })
         .catch((err) => {
+          asrFailures.current[speaker] += 1
+          if (asrFailures.current[speaker] >= 2 && !asrWarningDismissed.current) {
+            setAsrWarning(true)
+          }
           setError(errorMessage(err))
         })
         .finally(() => {
@@ -640,7 +1090,7 @@ export default function App() {
           }
         })
     },
-    [appendSegment, removePartial]
+    [appendSegment, removePartial, whisperPrompt]
   )
 
   const ask = useCallback(
@@ -672,21 +1122,29 @@ export default function App() {
         (opts?.anchorUid != null
           ? `final-Them-${opts.anchorUid}`
           : [...segmentsRef.current].reverse().find((s) => s.speaker === 'Them')?.id ?? undefined)
-      const assistantTurns: ChatMessage[] = answersRef.current
-        .filter((a) => a.text.trim() && !a.error)
-        .slice(-2)
-        .map((a) => ({ role: 'assistant', content: a.text }))
-      console.log(`[answer-anchor] ${anchorId ?? 'none'} | ${question ?? ''}`)
-      setAnswers((prev) => [
-        ...prev.filter((a) => a.id !== id).slice(-9),
-        { id, text: '', streaming: true, question, transcript, anchorId }
-      ])
+      // Auto resolves from the explicit question, else the latest remote turn.
+      const latestThem = [...segmentsRef.current].reverse().find((s) => s.speaker === 'Them')
+      const questionType = resolveQuestionType(
+        cfg.answer.questionType,
+        question ?? latestThem?.text ?? transcript
+      )
       // Outgoing images for this ask: none for regenerate, and none over IPC
       // when vision is off (main would drop them anyway). The model only sees
       // images when vision is enabled.
       const images =
         opts?.useAttachments === false || !cfg.llm.vision ? [] : attachments
       const hasImageAttachment = images.length > 0
+      const structured = hasImageAttachment && questionType === 'coding'
+      const assistantTurns: ChatMessage[] = answersRef.current
+        .filter((a) => a.text.trim() && !a.error)
+        .slice(-2)
+        .map((a) => ({ role: 'assistant', content: a.text }))
+      console.log(`[answer-anchor] ${anchorId ?? 'none'} | ${questionType} | ${question ?? ''}`)
+      if (structured) structuredAnswers.current.add(id)
+      setAnswers((prev) => [
+        ...prev.filter((a) => a.id !== id).slice(-9),
+        { id, text: '', streaming: true, question, transcript, anchorId, images }
+      ])
       const userContent = [
         `Session: ${titleRef.current}`,
         '',
@@ -696,7 +1154,7 @@ export default function App() {
         question ? `User question: ${question}` : 'Answer the latest question from the transcript.'
       ].join('\n')
       const messages: ChatMessage[] = [
-        { role: 'system', content: buildSystemPrompt(cfg, hasImageAttachment) },
+        { role: 'system', content: buildSystemPrompt(cfg, hasImageAttachment, questionType) },
         ...assistantTurns,
         { role: 'user', content: userContent }
       ]
@@ -705,15 +1163,24 @@ export default function App() {
       // (acceptable tradeoff; avoids silently attaching stale screenshots).
       setAttachments([])
       try {
-        await window.api.chat({
+        const result = await window.api.chat({
           id,
           messages,
           images,
-          vision: Boolean(cfg.llm.vision)
+          vision: Boolean(cfg.llm.vision),
+          questionType
         })
+        if (structured) {
+          const card = parseStructuredAnswer(result.text)
+          setAnswers((prev) =>
+            prev.map((a) => (a.id === id ? { ...a, card: card ?? undefined } : a))
+          )
+        }
       } catch (err) {
-        setError(errorMessage(err))
+        // A user stop rejects the invoke too; onLlmError handles the silent case.
+        if (!abortedAnswers.current.has(id)) setError(errorMessage(err))
       } finally {
+        structuredAnswers.current.delete(id)
         streaming.current = false
         lastAnswerAt.current = Date.now()
         setAnswers((prev) => prev.map((a) => (a.id === id ? { ...a, streaming: false } : a)))
@@ -739,6 +1206,15 @@ export default function App() {
     [ask]
   )
 
+  // Indirection keeps these callbacks referentially stable for memoized rows;
+  // ask/regenerate identities change when attachments or config change.
+  regenerateRef.current = regenerate
+  const onRegenerate = useCallback((answer: Answer) => regenerateRef.current(answer), [])
+  const onStopAnswer = useCallback((id: string) => {
+    abortedAnswers.current.add(id)
+    void window.api.abortChat(id).catch(() => undefined)
+  }, [])
+
   askRef.current = (question?: string, anchorUid?: number, useAttachments?: boolean) => {
     void ask({ question, anchorUid, useAttachments })
   }
@@ -748,7 +1224,7 @@ export default function App() {
       setAttachments((prev) => [...prev.slice(0, 9), dataUrl])
       const guidance = configRef.current?.llm.vision
         ? 'Screenshot attached — press Answer to include it'
-        : 'Screenshot attached — enable "Model supports images" in Settings to send it'
+        : 'Screenshot attached — enable "Active model supports images" in Settings → Models to send it'
       showToast(hint ? `${guidance} (${hint})` : guidance)
     },
     [showToast]
@@ -756,7 +1232,8 @@ export default function App() {
 
   const captureShot = useCallback(async () => {
     try {
-      attachImage(await window.api.captureScreen())
+      const shot = await window.api.captureScreen()
+      attachImage(shot.dataUrl, shot.hint)
     } catch (err) {
       setError(errorMessage(err))
     }
@@ -877,6 +1354,23 @@ export default function App() {
     }
   }, [closeRegionPicker, showToast])
 
+  const clearAll = useCallback(() => {
+    setSegments([])
+    segmentsRef.current = []
+    setAnswers([])
+    setAttachments([])
+    transcriptSavedRef.current = false
+    partialInfo.current = {
+      You: { uid: -1, applied: 0, finalizing: false },
+      Them: { uid: -1, applied: 0, finalizing: false }
+    }
+    partialSeq.current = { You: 0, Them: 0 }
+    partialBusy.current = { You: false, Them: false }
+    askedUids.current = new Set()
+    pendingAsks.current = []
+    promptRef.current = { You: '', Them: '' }
+  }, [])
+
   const startCapture = useCallback(async () => {
     setError(null)
     try {
@@ -929,27 +1423,107 @@ export default function App() {
       askedUids.current = new Set()
       pendingAsks.current = []
       chains.current = { You: Promise.resolve(), Them: Promise.resolve() }
+      transcriptSavedRef.current = false
       setListening(true)
+      void window.api.setCaptureListening(true).catch(() => undefined)
       setView('live')
       if (wantMic && !mic) setError('Microphone unavailable — capturing system audio only.')
       if (!system) setError('System audio unavailable — check your Windows output device.')
     } catch (err) {
       setError(errorMessage(err))
       setListening(false)
+      void window.api.setCaptureListening(false).catch(() => undefined)
     }
   }, [onWav])
 
   const beginSession = useCallback(async () => {
+    // A fresh session never inherits the previous transcript; resuming from the
+    // live view (Stop → Start) keeps the capture already in progress.
+    if (view !== 'live') clearAll()
     const next = await window.api.setConfig({
       session: { title, company, jobDescription, extraContext },
-      profile: { resume, background }
+      profile: { resume, background, vocabulary }
     })
     setConfig(next)
     await startCapture()
-  }, [title, company, jobDescription, extraContext, resume, background, startCapture])
+  }, [
+    view,
+    clearAll,
+    title,
+    company,
+    jobDescription,
+    extraContext,
+    resume,
+    background,
+    vocabulary,
+    startCapture
+  ])
 
   beginRef.current = () => {
     if (!listeningRef.current) void beginSession()
+  }
+
+  const applyResumePdf = (result: {
+    text: string
+    pagesProcessed: number
+    truncated: boolean
+  }): void => {
+    setResume(result.text.slice(0, 30000))
+    const pages = result.pagesProcessed
+    const detail = result.truncated
+      ? 'stopped at the character cap'
+      : 'up to 30,000 characters'
+    showToast(`Imported ${pages} page${pages === 1 ? '' : 's'} (${detail})`)
+  }
+
+  const importResumePdf = async (): Promise<void> => {
+    try {
+      const result = await window.api.extractPdf()
+      if (!result) return
+      if (!result.text.trim()) {
+        showToast('No text found in that PDF')
+        return
+      }
+      // Inline confirm: native dialogs are visible to everyone on a screen share.
+      if (resume.trim()) {
+        setPendingResumePdf(result)
+        return
+      }
+      applyResumePdf(result)
+    } catch (err) {
+      showToast(`PDF import failed: ${errorMessage(err)}`)
+    }
+  }
+
+  const importJobLink = async (opts?: { url?: string; force?: boolean }): Promise<void> => {
+    const url = (opts?.url ?? jobUrl).trim()
+    if (!url || jobFetching) return
+    if (!opts?.force && jobDescription.trim()) {
+      setPendingJobReplaceUrl(url)
+      return
+    }
+    setPendingJobReplaceUrl(null)
+    setJobFetching(true)
+    try {
+      const result = await window.api.fetchJob(url)
+      setJobDescription(result.text.slice(0, 10000))
+      if (!company.trim() && result.title) setCompany(result.title)
+      setJobUrl('')
+      showToast('Job description imported')
+    } catch (err) {
+      const reason = errorMessage(err)
+        .replace(/^Error invoking remote method '[^']+': (?:Error: )?/, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 60)
+      showToast(
+        reason
+          ? `Couldn't fetch (${reason}) — paste it manually`
+          : "Couldn't fetch — paste it manually"
+      )
+    } finally {
+      setJobFetching(false)
+    }
   }
 
   // Test hook: main process can trigger capture when PC_AUTOSTART=1.
@@ -973,43 +1547,141 @@ export default function App() {
       queueTimer.current = null
     }
     setListening(false)
+    void window.api.setCaptureListening(false).catch(() => undefined)
     setLevels({ you: 0, them: 0 })
   }, [])
 
-  const endSession = useCallback(async () => {
-    stopCapture()
-    if (segmentsRef.current.length > 0) {
-      const saved = await window.api.saveSession({
-        title: titleRef.current,
-        endedAt: new Date().toISOString(),
-        segments: segmentsRef.current,
-        answers: answers.map((a) => ({
-          text: a.text,
-          error: a.error,
-          question: a.question,
-          anchorId: a.anchorId
-        }))
-      })
-      if (saved) showToast(`Session saved: ${saved}`)
+  // Snapshot shared by the real save and the 120s autosave. Orphan anchors get
+  // a placeholder so history keeps the Q→A pairing.
+  const buildSavePayload = useCallback((endedAt: string) => {
+    const sessionSegments = [...segmentsRef.current]
+    const currentAnswers = answersRef.current
+    for (const answer of currentAnswers) {
+      const anchorId = answer.anchorId
+      if (anchorId && !sessionSegments.some((s) => s.id === anchorId)) {
+        sessionSegments.push({
+          id: anchorId,
+          speaker: 'Them',
+          text: '(question not captured)',
+          ts: Date.now()
+        })
+      }
     }
-    setView('home')
-  }, [answers, showToast, stopCapture])
-
-  const clearAll = useCallback(() => {
-    setSegments([])
-    segmentsRef.current = []
-    setAnswers([])
-    setAttachments([])
-    partialInfo.current = {
-      You: { uid: -1, applied: 0, finalizing: false },
-      Them: { uid: -1, applied: 0, finalizing: false }
+    // Keep the 10 most recent unique screenshots, newest answers first.
+    const keptImages = new Set<string>()
+    const imagesByAnswer: Array<string[] | undefined> = []
+    for (let i = currentAnswers.length - 1; i >= 0; i--) {
+      const keep: string[] = []
+      const imageList = currentAnswers[i].images ?? []
+      for (let j = imageList.length - 1; j >= 0; j--) {
+        const url = imageList[j]
+        if (keptImages.has(url) || keptImages.size >= MAX_SESSION_IMAGES) continue
+        keptImages.add(url)
+        keep.unshift(url)
+      }
+      imagesByAnswer[i] = keep.length > 0 ? keep : undefined
     }
-    partialSeq.current = { You: 0, Them: 0 }
-    partialBusy.current = { You: false, Them: false }
-    askedUids.current = new Set()
-    pendingAsks.current = []
-    promptRef.current = { You: '', Them: '' }
+    return {
+      title: titleRef.current,
+      company: companyRef.current.trim(),
+      endedAt,
+      segments: sessionSegments,
+      answers: currentAnswers.map((a, index) => ({
+        text: a.text,
+        error: a.error,
+        question: a.question,
+        anchorId: a.anchorId,
+        images: imagesByAnswer[index]
+      }))
+    }
   }, [])
+
+  // In-flight finals must land before the snapshot; one stalled ASR call cannot
+  // hold End/quit hostage for longer than the cap.
+  const drainChains = useCallback(async (): Promise<void> => {
+    const pending = [chains.current.You, chains.current.Them].filter(Boolean)
+    if (pending.length === 0) return
+    let timer: number | undefined
+    try {
+      await Promise.race([
+        Promise.allSettled(pending),
+        new Promise<void>((resolve) => {
+          timer = window.setTimeout(resolve, CHAIN_DRAIN_TIMEOUT_MS)
+        })
+      ])
+    } finally {
+      if (timer !== undefined) window.clearTimeout(timer)
+    }
+  }, [])
+
+  const endSession = useCallback(
+    async (thenQuit = false) => {
+      if (thenQuit) endQuitPendingRef.current = true
+      // Quit path: main is waiting on us; acknowledge before the drain so its
+      // 2s "unreachable renderer" fallback does not kill a real save. A second
+      // concurrent call still acks, then returns without saving again.
+      if (thenQuit) void window.api.ackEndSession().catch(() => undefined)
+      if (endingSessionRef.current) return
+      endingSessionRef.current = true
+      try {
+        stopCapture()
+        await drainChains()
+        if (
+          !transcriptSavedRef.current &&
+          (segmentsRef.current.length > 0 || answersRef.current.length > 0)
+        ) {
+          try {
+            const saved = await window.api.saveSession(buildSavePayload(new Date().toISOString()))
+            if (saved) {
+              transcriptSavedRef.current = true
+              showToast(`Session saved: ${saved}`)
+              // Start the next session empty; otherwise Settings → Back could
+              // re-save this transcript into a new session file.
+              clearAll()
+            }
+            void loadHistory()
+          } catch (err) {
+            // session:save now rejects on a write failure; keep it visible.
+            const message = errorMessage(err).replace(
+              /^Error invoking remote method '[^']+': (?:Error: )?/,
+              ''
+            )
+            setError(message)
+            showToast(message)
+          }
+        }
+        setView('home')
+        if (thenQuit || endQuitPendingRef.current) {
+          try {
+            await window.api.quitAfterSave()
+          } catch {
+            /* main is already quitting */
+          }
+        }
+      } finally {
+        endingSessionRef.current = false
+        endQuitPendingRef.current = false
+      }
+    },
+    [buildSavePayload, clearAll, drainChains, showToast, stopCapture, loadHistory]
+  )
+
+  endRef.current = (thenQuit) => {
+    void endSession(thenQuit)
+  }
+
+  // Crash/quit recovery: overwrite one fixed session file every 2 minutes while
+  // listening (no toast). A successful real save removes it in main.
+  useEffect(() => {
+    if (!listening) return
+    const timer = window.setInterval(() => {
+      if (segmentsRef.current.length === 0 && answersRef.current.length === 0) return
+      void window.api
+        .saveSession(buildSavePayload(new Date().toISOString()), { autosave: true })
+        .catch(() => undefined)
+    }, AUTOSAVE_INTERVAL_MS)
+    return () => window.clearInterval(timer)
+  }, [listening, buildSavePayload])
 
   const deleteSession = useCallback(
     async (name: string) => {
@@ -1113,6 +1785,48 @@ export default function App() {
     )
   }
 
+  const activeProfile =
+    config.llm.profiles.find((profile) => profile.id === config.llm.activeProfileId) ??
+    config.llm.profiles[0]
+
+  // Saved immediately; main resolves the active profile when the next ask
+  // starts, so switching never touches an in-flight stream.
+  const switchProfile = async (id: string): Promise<void> => {
+    setModelMenuOpen(false)
+    if (id === config.llm.activeProfileId) return
+    try {
+      const next = await window.api.setConfig({ llm: { ...config.llm, activeProfileId: id } })
+      setConfig(next)
+      showToast(`Model: ${next.llm.profiles.find((profile) => profile.id === id)?.label ?? id}`)
+    } catch (err) {
+      setError(errorMessage(err))
+    }
+  }
+
+  // Auto resolves live from the composer text, else the latest remote turn.
+  const resolvedQuestionType = resolveQuestionType(
+    config.answer.questionType,
+    input.trim() || [...segments].reverse().find((s) => s.speaker === 'Them')?.text || ''
+  )
+
+  // Persisted immediately; the next ask reads it from configRef.
+  const updateQuestionType = (value: QuestionType): void => {
+    if (value === config.answer.questionType) return
+    setConfig((prev) =>
+      prev ? { ...prev, answer: { ...prev.answer, questionType: value } } : prev
+    )
+    void window.api
+      .setConfig({ answer: { ...config.answer, questionType: value } })
+      .then(setConfig)
+      .catch((err) => {
+        setError(errorMessage(err))
+        void window.api
+          .getConfig()
+          .then(({ config: latest }) => setConfig(latest))
+          .catch(() => undefined)
+      })
+  }
+
   return (
     <div className="app">
       <div
@@ -1139,13 +1853,13 @@ export default function App() {
                 <button className="icon-btn" title="Settings" onClick={() => setView('settings')}>
                   ⚙
                 </button>
-                <button className="icon-btn" title="Hide (Ctrl+H)" onClick={() => void window.api.hideWindow()}>
+                <button className="icon-btn" title="Hide (Ctrl+Shift+H)" onClick={() => void window.api.hideWindow()}>
                   ▁
                 </button>
               </>
             )}
             {view !== 'live' && (
-              <button className="icon-btn" title="Hide (Ctrl+H)" onClick={() => void window.api.hideWindow()}>
+              <button className="icon-btn" title="Hide (Ctrl+Shift+H)" onClick={() => void window.api.hideWindow()}>
                 ▁
               </button>
             )}
@@ -1163,6 +1877,25 @@ export default function App() {
           </div>
         )}
         {toast && <div className="banner info">{toast}</div>}
+        {corruptBackup && !corruptBannerDismissed && (
+          <div className="banner error" onClick={() => setCorruptBannerDismissed(true)}>
+            config.json was corrupt; defaults loaded. Backup:{' '}
+            <span className="mono">{corruptBackup}</span>
+            <span className="dismiss">×</span>
+          </div>
+        )}
+        {asrWarning && (
+          <div
+            className="banner error"
+            onClick={() => {
+              setAsrWarning(false)
+              asrWarningDismissed.current = true
+            }}
+          >
+            Speech endpoint not responding — check whisper-server
+            (scripts\start-whisper.ps1) <span className="dismiss">×</span>
+          </div>
+        )}
         {updateReady && (
           <div className="banner info">
             Update {updateReady.version} downloaded —{' '}
@@ -1229,6 +1962,17 @@ export default function App() {
 
         {view === 'home' && (
           <div className="home">
+            {autosaveAvailable && !autosaveBannerDismissed && (
+              <div className="banner info">
+                Unsaved transcript recovered —{' '}
+                <button className="btn tiny" onClick={() => setView('history')}>
+                  view in History
+                </button>
+                <span className="dismiss" onClick={() => setAutosaveBannerDismissed(true)}>
+                  ×
+                </span>
+              </div>
+            )}
             <label className="field">
               <span>Session title</span>
               <input
@@ -1252,17 +1996,64 @@ export default function App() {
                 value={company}
                 onChange={(e) => setCompany(e.target.value)}
                 placeholder="e.g. Acme Corp"
+                list="company-history"
               />
+              <datalist id="company-history">
+                {companyOptions.map((value) => (
+                  <option key={value} value={value} />
+                ))}
+              </datalist>
             </label>
             <label className="field">
               <span>Job description</span>
               <textarea
                 rows={3}
                 value={jobDescription}
-                onChange={(e) => setJobDescription(e.target.value)}
+                onChange={(e) => setJobDescription(e.target.value.slice(0, 10000))}
                 placeholder="Paste the role description"
               />
             </label>
+            <div className="row gap">
+              <input
+                className="job-link"
+                value={jobUrl}
+                onChange={(e) => setJobUrl(e.target.value)}
+                placeholder="https://company.com/jobs/123"
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault()
+                    void importJobLink()
+                  }
+                }}
+              />
+              <button
+                className="btn tiny"
+                disabled={jobFetching || !jobUrl.trim()}
+                onClick={() => void importJobLink()}
+              >
+                {jobFetching ? 'Fetching…' : 'Paste job link'}
+              </button>
+            </div>
+            {pendingJobReplaceUrl && (
+              // Inline (not native) so the prompt never appears in a screen share.
+              <div className="row gap">
+                <span className="hint small">Replace the current job description?</span>
+                <button
+                  className="btn tiny"
+                  onClick={() =>
+                    void importJobLink({
+                      url: pendingJobReplaceUrl ?? undefined,
+                      force: true
+                    })
+                  }
+                >
+                  Replace
+                </button>
+                <button className="btn tiny ghost" onClick={() => setPendingJobReplaceUrl(null)}>
+                  Cancel
+                </button>
+              </div>
+            )}
             <label className="field">
               <span>Extra instructions</span>
               <textarea
@@ -1282,11 +2073,24 @@ export default function App() {
               />
             </label>
             <label className="field">
+              <span>Names &amp; jargon (for transcription)</span>
+              <textarea
+                rows={2}
+                value={vocabulary}
+                onChange={(e) => setVocabulary(e.target.value)}
+                placeholder="e.g. Acme, KubeRAG, gRPC, SRE"
+              />
+            </label>
+            <p className="hint small">
+              Comma or newline separated. Prepended to the speech prompt with the company name
+              (700-char budget).
+            </p>
+            <label className="field">
               <span>Résumé text</span>
               <textarea
                 rows={4}
                 value={resume}
-                onChange={(e) => setResume(e.target.value.slice(0, 20000))}
+                onChange={(e) => setResume(e.target.value.slice(0, 30000))}
                 placeholder="Paste your résumé (used as the factual source for answers)"
               />
             </label>
@@ -1302,18 +2106,44 @@ export default function App() {
                     const file = input.files?.[0]
                     if (!file) return
                     const text = await file.text()
-                    setResume(text.slice(0, 20000))
+                    setResume(text.slice(0, 30000))
                     input.value = ''
                   }}
                 />
               </label>
-              <span className="hint small">.txt / .md / .json — paste PDF text manually</span>
+              <button className="btn tiny" onClick={() => void importResumePdf()}>
+                Import PDF
+              </button>
+              <span className="hint small">.txt / .md / .json, or Import PDF</span>
             </div>
+            <p className="hint small">
+              File dialogs aren't hidden during screen shares — import before you start sharing.
+            </p>
+            {pendingResumePdf && (
+              // Inline (not native) so the prompt never appears in a screen share.
+              <div className="row gap">
+                <span className="hint small">Replace existing résumé text?</span>
+                <button
+                  className="btn tiny"
+                  onClick={() => {
+                    const pending = pendingResumePdf
+                    if (!pending) return
+                    setPendingResumePdf(null)
+                    applyResumePdf(pending)
+                  }}
+                >
+                  Replace
+                </button>
+                <button className="btn tiny ghost" onClick={() => setPendingResumePdf(null)}>
+                  Cancel
+                </button>
+              </div>
+            )}
 
             <div className="providers">
               <div>
                 <span className="label">Answers</span>
-                <span className="mono">{config.llm.model}</span>
+                <span className="mono">{activeProfile.model || activeProfile.label}</span>
               </div>
               <div>
                 <span className="label">Speech</span>
@@ -1335,13 +2165,50 @@ export default function App() {
             </div>
             <p className="hint small">
               Hotkeys: Ctrl+Shift+Enter answer · Ctrl+Alt+Enter screenshot · Ctrl+Shift+Space chat ·
-              Ctrl+Shift+arrows move · Ctrl+H hide
+              Ctrl+Shift+arrows move · Ctrl+Shift+H hide
             </p>
           </div>
         )}
 
         {view === 'live' && (
           <div className="live">
+            <div className="live-head">
+              <div className="model-switch" ref={modelSwitchRef}>
+                <button
+                  className="model-chip"
+                  title="Applies to your next question"
+                  onClick={() => setModelMenuOpen((open) => !open)}
+                >
+                  <span className={`badge ${activeProfile.badge}`}>
+                    {badgeLabel(activeProfile.badge)}
+                  </span>
+                  <span className="model-chip-label">{activeProfile.label}</span>
+                  <span className="model-chip-caret">▾</span>
+                </button>
+                {modelMenuOpen && (
+                  <div className="model-menu" role="menu">
+                    {config.llm.profiles.map((profile) => {
+                      const selected = profile.id === config.llm.activeProfileId
+                      return (
+                        <button
+                          key={profile.id}
+                          role="menuitemradio"
+                          aria-checked={selected}
+                          className={`model-menu-item${selected ? ' active' : ''}`}
+                          onClick={() => void switchProfile(profile.id)}
+                        >
+                          <span className={`badge ${profile.badge}`}>
+                            {badgeLabel(profile.badge)}
+                          </span>
+                          <span className="model-menu-label">{profile.label}</span>
+                          <span className="model-menu-check">{selected ? '✓' : ''}</span>
+                        </button>
+                      )
+                    })}
+                  </div>
+                )}
+              </div>
+            </div>
             <div className="meters">
               <div className="meter">
                 <span className="meter-label">You</span>
@@ -1375,48 +2242,14 @@ export default function App() {
 
               {thread.map((item) =>
                 item.kind === 'seg' ? (
-                  <div
-                    key={item.segment.id}
-                    className={`seg${item.segment.partial ? ' partial' : ''}`}
-                  >
-                    <span
-                      className={`speaker ${item.segment.speaker === 'You' ? 'you' : 'them'}`}
-                    >
-                      {item.segment.speaker}
-                    </span>
-                    <span className="seg-text">
-                      {item.segment.text}
-                      {item.segment.partial ? ' …' : ''}
-                    </span>
-                  </div>
+                  <SegmentRow key={item.segment.id} segment={item.segment} />
                 ) : (
-                  <div key={item.answer.id} className="answer">
-                    <div className="answer-head">
-                      <span className="speaker answer-tag">Answer</span>
-                      {item.answer.streaming && <span className="streaming">…</span>}
-                      <div className="answer-actions">
-                        {!item.answer.streaming && !item.answer.error && (
-                          <button className="copy" onClick={() => regenerate(item.answer)}>
-                            Regenerate
-                          </button>
-                        )}
-                        <button
-                          className="copy"
-                          title="Copy"
-                          onClick={() => void navigator.clipboard.writeText(item.answer.text)}
-                        >
-                          Copy
-                        </button>
-                      </div>
-                    </div>
-                    {item.answer.error ? (
-                      <div className="answer-error">{item.answer.error}</div>
-                    ) : (
-                      <div className="answer-text">
-                        {item.answer.text || (item.answer.streaming ? '' : '—')}
-                      </div>
-                    )}
-                  </div>
+                  <AnswerRow
+                    key={item.answer.id}
+                    answer={item.answer}
+                    onRegenerate={onRegenerate}
+                    onStop={onStopAnswer}
+                  />
                 )
               )}
             </div>
@@ -1448,6 +2281,21 @@ export default function App() {
                 }}
               />
               <div className="composer-actions">
+                <select
+                  className="type-select"
+                  title="Question type — Auto guesses from the question and affects effort, STAR and coding format"
+                  value={config.answer.questionType}
+                  onChange={(e) => updateQuestionType(e.target.value as QuestionType)}
+                >
+                  <option value="auto">
+                    Auto · {QUESTION_TYPE_LABELS[resolvedQuestionType]}
+                  </option>
+                  {QUESTION_TYPE_OPTIONS.map((type) => (
+                    <option key={type} value={type}>
+                      {QUESTION_TYPE_LABELS[type]}
+                    </option>
+                  ))}
+                </select>
                 <button className="btn" onClick={() => void captureShot()} title="Ctrl+Alt+Enter">
                   Screenshot
                 </button>
@@ -1490,7 +2338,7 @@ export default function App() {
               const next = await window.api.setConfig({
                 ...draft,
                 session: { ...draft.session, title, company, jobDescription, extraContext },
-                profile: { resume, background }
+                profile: { resume, background, vocabulary }
               })
               setConfig(next)
               showToast('Settings saved')
@@ -1533,8 +2381,23 @@ export default function App() {
                     }
                     const items: Array<
                       | { kind: 'seg'; key: string; speaker: string; text: string }
-                      | { kind: 'ans'; key: string; text: string }
+                      | {
+                          kind: 'ans'
+                          key: string
+                          text: string
+                          images?: string[]
+                          card?: StructuredAnswer
+                        }
                     > = []
+                    const answerItem = (answer: (typeof answerList)[number], key: string) => ({
+                      kind: 'ans' as const,
+                      key,
+                      text: answer.text || answer.error || '',
+                      images: answer.images,
+                      card: answer.error
+                        ? undefined
+                        : parseStructuredAnswer(answer.text ?? '') ?? undefined
+                    })
                     segments.forEach((segment, index) => {
                       items.push({
                         kind: 'seg',
@@ -1546,11 +2409,7 @@ export default function App() {
                       const anchored = byAnchor.get(segment.id)
                       if (anchored) {
                         anchored.forEach((answer, answerIndex) =>
-                          items.push({
-                            kind: 'ans',
-                            key: `s${index}a${answerIndex}`,
-                            text: answer.text || answer.error || ''
-                          })
+                          items.push(answerItem(answer, `s${index}a${answerIndex}`))
                         )
                         byAnchor.delete(segment.id)
                       }
@@ -1558,19 +2417,11 @@ export default function App() {
                     let extra = 0
                     for (const list of byAnchor.values()) {
                       for (const answer of list) {
-                        items.push({
-                          kind: 'ans',
-                          key: `x${extra++}`,
-                          text: answer.text || answer.error || ''
-                        })
+                        items.push(answerItem(answer, `x${extra++}`))
                       }
                     }
                     for (const answer of loose) {
-                      items.push({
-                        kind: 'ans',
-                        key: `l${extra++}`,
-                        text: answer.text || answer.error || ''
-                      })
+                      items.push(answerItem(answer, `l${extra++}`))
                     }
                     return items.map((item) =>
                       item.kind === 'seg' ? (
@@ -1584,8 +2435,26 @@ export default function App() {
                         <div key={item.key} className="answer">
                           <div className="answer-head">
                             <span className="speaker answer-tag">Answer</span>
+                            {item.card && <span className="answer-kind">coded</span>}
                           </div>
-                          <div className="answer-text">{item.text}</div>
+                          {item.card ? (
+                            <StructuredAnswerCard card={item.card} />
+                          ) : (
+                            <div className="answer-text">{item.text}</div>
+                          )}
+                          {item.images && item.images.length > 0 && (
+                            <div className="attachments history-images">
+                              {item.images.map((url, imageIndex) => (
+                                <img
+                                  key={imageIndex}
+                                  className="thumb"
+                                  src={url}
+                                  alt={`Screenshot ${imageIndex + 1}`}
+                                  title="Screenshot"
+                                />
+                              ))}
+                            </div>
+                          )}
                         </div>
                       )
                     )
@@ -1681,7 +2550,17 @@ function Settings({
   const [captureTesting, setCaptureTesting] = useState(false)
   const [hotkeys, setHotkeys] = useState<HotkeyInfo[]>([])
 
-  useEffect(() => setDraft(config), [config])
+  // Background config writes (hotkeys, click-through, meeting toggles) must not
+  // clobber edits in progress: only re-sync when the draft is clean.
+  const draftRef = useRef(draft)
+  const syncedConfigRef = useRef(config)
+  draftRef.current = draft
+
+  useEffect(() => {
+    if (JSON.stringify(draftRef.current) !== JSON.stringify(syncedConfigRef.current)) return
+    syncedConfigRef.current = config
+    setDraft(config)
+  }, [config])
 
   useEffect(() => {
     void window.api
@@ -1713,6 +2592,129 @@ function Settings({
   }
   const setMeetings = (key: keyof AppConfig['meetings'], value: boolean): void => {
     setDraft((prev) => ({ ...prev, meetings: { ...prev.meetings, [key]: value } }))
+  }
+
+  // --- Model profile editing (saved with the rest of the draft) ------------
+  const [advanced, setAdvanced] = useState<Record<string, boolean>>({})
+  const [pickingModel, setPickingModel] = useState(false)
+  // Remember the last numeric value while a field is omitted, so toggling Omit
+  // restores it instead of a hard-coded default.
+  const [lastNumbers, setLastNumbers] = useState<
+    Record<string, { temperature?: number; maxTokens?: number }>
+  >({})
+
+  const updateProfile = (id: string, patch: Partial<ModelProfile>): void => {
+    setDraft((prev) => ({
+      ...prev,
+      llm: {
+        ...prev.llm,
+        profiles: prev.llm.profiles.map((profile) =>
+          profile.id === id ? { ...profile, ...patch } : profile
+        )
+      }
+    }))
+  }
+
+  const rememberNumber = (
+    id: string,
+    key: 'temperature' | 'maxTokens',
+    value: number
+  ): void => {
+    setLastNumbers((prev) => ({
+      ...prev,
+      [id]: {
+        ...prev[id],
+        ...(key === 'temperature' ? { temperature: value } : { maxTokens: value })
+      }
+    }))
+  }
+
+  const setProfileNumber = (
+    id: string,
+    key: 'temperature' | 'maxTokens',
+    value: number | null
+  ): void => {
+    if (value != null) rememberNumber(id, key, value)
+    if (key === 'temperature') updateProfile(id, { temperature: value })
+    else updateProfile(id, { maxTokens: value })
+  }
+
+  const toggleOmit = (
+    profile: ModelProfile,
+    key: 'temperature' | 'maxTokens',
+    omit: boolean
+  ): void => {
+    if (!omit) {
+      const fallback = key === 'temperature' ? 0.2 : 4096
+      setProfileNumber(profile.id, key, lastNumbers[profile.id]?.[key] ?? fallback)
+      return
+    }
+    const current = key === 'temperature' ? profile.temperature : profile.maxTokens
+    if (current != null) rememberNumber(profile.id, key, current)
+    updateProfile(
+      profile.id,
+      key === 'temperature' ? { temperature: null } : { maxTokens: null }
+    )
+  }
+
+  const addProfile = (profile: ModelProfile): void => {
+    setDraft((prev) => ({
+      ...prev,
+      llm: { ...prev.llm, profiles: [...prev.llm.profiles, profile] }
+    }))
+    setPickingModel(false)
+  }
+
+  const addCatalogProfile = (entry: ModelCatalogEntry): void => {
+    addProfile({
+      id: uid(),
+      label: entry.label,
+      badge: entry.badge,
+      baseUrl: entry.baseUrl,
+      apiKey: '',
+      model: entry.model,
+      // Anthropic 5.x rejects temperature: the catalog flag decides.
+      temperature: entry.supportsTemperature ? 0.2 : null,
+      maxTokens: 4096,
+      effort: entry.effort,
+      escalateOnCode: false
+    })
+  }
+
+  const addCustomProfile = (): void => {
+    addProfile({
+      id: uid(),
+      label: 'Custom / OpenRouter',
+      badge: 'recommended',
+      baseUrl: '',
+      apiKey: '',
+      model: '',
+      // Blank fields stay omitted until the user chooses values.
+      temperature: null,
+      maxTokens: null,
+      effort: 'default',
+      escalateOnCode: false
+    })
+  }
+
+  const removeProfile = (id: string): void => {
+    setDraft((prev) => {
+      if (prev.llm.profiles.length <= 1) return prev
+      const profiles = prev.llm.profiles.filter((profile) => profile.id !== id)
+      return {
+        ...prev,
+        llm: {
+          ...prev.llm,
+          profiles,
+          activeProfileId:
+            prev.llm.activeProfileId === id ? profiles[0].id : prev.llm.activeProfileId
+        }
+      }
+    })
+  }
+
+  const activateProfile = (id: string): void => {
+    setDraft((prev) => ({ ...prev, llm: { ...prev.llm, activeProfileId: id } }))
   }
 
   const runCaptureTest = async (): Promise<void> => {
@@ -1773,79 +2775,204 @@ function Settings({
         </div>
         <p className="hint small">Presets change effort and answer style only — the model is not changed.</p>
 
-        <h3>Answer engine (OpenAI-compatible)</h3>
-        <label className="field">
-          <span>Base URL</span>
-          <input
-            value={draft.llm.baseUrl}
-            onChange={(e) => setLlm('baseUrl', e.target.value)}
-            placeholder="http://127.0.0.1:11434/v1"
-          />
-        </label>
-        <label className="field">
-          <span>API key (optional)</span>
-          <input
-            type="password"
-            value={draft.llm.apiKey}
-            onChange={(e) => setLlm('apiKey', e.target.value)}
-            placeholder="sk-…"
-          />
-        </label>
-        <label className="field">
-          <span>Model</span>
-          <input
-            value={draft.llm.model}
-            onChange={(e) => setLlm('model', e.target.value)}
-            placeholder="qwen2.5vl:7b"
-          />
-        </label>
-        <div className="grid2">
-          <label className="field">
-            <span>Temperature (0–1)</span>
-            <input
-              type="number"
-              step="0.05"
-              min="0"
-              max="1"
-              value={draft.llm.temperature}
-              onChange={(e) => setLlm('temperature', Number(e.target.value))}
-            />
-          </label>
-          <label className="field">
-            <span>Max tokens (128–8192)</span>
-            <input
-              type="number"
-              step="64"
-              min="128"
-              max="8192"
-              value={draft.llm.maxTokens}
-              onChange={(e) => setLlm('maxTokens', Number(e.target.value))}
-            />
-          </label>
+        <h3>Models</h3>
+        <p className="hint small">
+          Each profile is a full endpoint identity (base URL, key, model, sampling). The active
+          profile is used for new questions; switch it from the live-view header — no restart, and
+          it never interrupts a streaming answer.
+        </p>
+        {draft.llm.profiles.map((profile) => {
+          const isActive = profile.id === draft.llm.activeProfileId
+          const showAdvanced = Boolean(advanced[profile.id])
+          return (
+            <div className={`profile-card${isActive ? ' active' : ''}`} key={profile.id}>
+              <div className="profile-head">
+                <input
+                  className="profile-label"
+                  value={profile.label}
+                  aria-label="Profile label"
+                  onChange={(e) => updateProfile(profile.id, { label: e.target.value })}
+                />
+                <span className={`badge ${profile.badge}`}>{badgeLabel(profile.badge)}</span>
+                <button
+                  className="btn tiny"
+                  title={isActive ? 'This profile answers new questions' : 'Use this profile'}
+                  disabled={isActive}
+                  onClick={() => activateProfile(profile.id)}
+                >
+                  {isActive ? 'Active' : 'Use'}
+                </button>
+              </div>
+              <span className="mono profile-model">{profile.model || '(no model id yet)'}</span>
+              <label className="field">
+                <span>Model ID</span>
+                <input
+                  value={profile.model}
+                  onChange={(e) => updateProfile(profile.id, { model: e.target.value })}
+                  placeholder="gemini-3.8-flash"
+                />
+              </label>
+              <label className="field">
+                <span>API key</span>
+                <input
+                  type="password"
+                  value={profile.apiKey}
+                  onChange={(e) => updateProfile(profile.id, { apiKey: e.target.value })}
+                  placeholder="sk-…"
+                />
+              </label>
+              <button
+                className="btn tiny ghost"
+                onClick={() => setAdvanced((prev) => ({ ...prev, [profile.id]: !showAdvanced }))}
+              >
+                {showAdvanced ? 'Advanced ▲' : 'Advanced ▼'}
+              </button>
+              {showAdvanced && (
+                <div className="profile-advanced">
+                  <label className="field">
+                    <span>Base URL</span>
+                    <input
+                      value={profile.baseUrl}
+                      onChange={(e) => updateProfile(profile.id, { baseUrl: e.target.value })}
+                      placeholder="https://api.openai.com/v1"
+                    />
+                  </label>
+                  <div className="grid2">
+                    <label className="field">
+                      <span>Temperature (0–1)</span>
+                      <input
+                        type="number"
+                        step="0.05"
+                        min="0"
+                        max="1"
+                        placeholder="omitted"
+                        value={profile.temperature ?? ''}
+                        onChange={(e) => {
+                          if (e.target.value === '') {
+                            toggleOmit(profile, 'temperature', true)
+                            return
+                          }
+                          const parsed = Number(e.target.value)
+                          if (Number.isFinite(parsed)) {
+                            setProfileNumber(profile.id, 'temperature', parsed)
+                          }
+                        }}
+                      />
+                    </label>
+                    <label className="field">
+                      <span>Max tokens (128–8192)</span>
+                      <input
+                        type="number"
+                        step="64"
+                        min="128"
+                        max="8192"
+                        placeholder="omitted"
+                        value={profile.maxTokens ?? ''}
+                        onChange={(e) => {
+                          if (e.target.value === '') {
+                            toggleOmit(profile, 'maxTokens', true)
+                            return
+                          }
+                          const parsed = Number(e.target.value)
+                          if (Number.isFinite(parsed)) {
+                            setProfileNumber(profile.id, 'maxTokens', parsed)
+                          }
+                        }}
+                      />
+                    </label>
+                  </div>
+                  <label className="check">
+                    <input
+                      type="checkbox"
+                      checked={profile.temperature === null}
+                      onChange={(e) => toggleOmit(profile, 'temperature', e.target.checked)}
+                    />
+                    <span>Omit temperature — let the vendor pick its default</span>
+                  </label>
+                  <label className="check">
+                    <input
+                      type="checkbox"
+                      checked={profile.maxTokens === null}
+                      onChange={(e) => toggleOmit(profile, 'maxTokens', e.target.checked)}
+                    />
+                    <span>Omit max tokens</span>
+                  </label>
+                  <label className="field">
+                    <span>Reasoning effort</span>
+                    <select
+                      value={profile.effort}
+                      onChange={(e) =>
+                        updateProfile(profile.id, { effort: e.target.value as EffortSetting })
+                      }
+                    >
+                      <option value="default">Default — omit (vendor decides)</option>
+                      <option value="low">Low — fast</option>
+                      <option value="medium">Medium — balanced</option>
+                      <option value="high">High — hard questions (slower)</option>
+                    </select>
+                  </label>
+                  <label className="check">
+                    <input
+                      type="checkbox"
+                      checked={profile.escalateOnCode}
+                      onChange={(e) =>
+                        updateProfile(profile.id, { escalateOnCode: e.target.checked })
+                      }
+                    />
+                    <span>Escalate low → high for coding/screenshot questions</span>
+                  </label>
+                  <button
+                    className="btn tiny danger"
+                    disabled={draft.llm.profiles.length <= 1}
+                    onClick={() => removeProfile(profile.id)}
+                  >
+                    Delete profile
+                  </button>
+                </div>
+              )}
+            </div>
+          )
+        })}
+        <div className="row gap">
+          <button className="btn" onClick={() => setPickingModel((open) => !open)}>
+            {pickingModel ? 'Close catalog' : 'Add model'}
+          </button>
+          <span className="hint small">
+            Badges show expected speed. Anthropic 5.x profiles omit temperature and effort.
+          </span>
         </div>
-        <label className="field">
-          <span>Reasoning effort</span>
-          <select
-            value={draft.llm.reasoningEffort}
-            onChange={(e) =>
-              setLlm('reasoningEffort', e.target.value as AppConfig['llm']['reasoningEffort'])
-            }
-          >
-            <option value="low">Low — fast (default)</option>
-            <option value="medium">Medium — balanced</option>
-            <option value="high">High — hard algorithmic (slower; use max tokens ≥ 4096)</option>
-          </select>
-        </label>
+        {pickingModel && (
+          <div className="catalog">
+            {MODEL_CATALOG.map((entry) => (
+              <button
+                key={entry.model}
+                className="catalog-item"
+                onClick={() => addCatalogProfile(entry)}
+              >
+                <span className={`badge ${entry.badge}`}>{badgeLabel(entry.badge)}</span>
+                <span className="catalog-label">{entry.label}</span>
+                <span className="catalog-vendor">{entry.vendor}</span>
+                <span className="mono catalog-model">{entry.model}</span>
+              </button>
+            ))}
+            <button className="catalog-item custom" onClick={addCustomProfile}>
+              <span className="catalog-label">Custom / OpenRouter…</span>
+              <span className="catalog-vendor">manual — blank fields</span>
+            </button>
+          </div>
+        )}
         <label className="check">
           <input
             type="checkbox"
-            checked={draft.llm.autoEscalate}
-            onChange={(e) => setLlm('autoEscalate', e.target.checked)}
+            checked={draft.llm.vision}
+            onChange={(e) => setLlm('vision', e.target.checked)}
           />
-          <span>
-            Auto-escalate effort on coding questions (raises low → high; adds first-token latency)
-          </span>
+          <span>Active model supports images (needed for screenshots in answers)</span>
         </label>
+        <p className="hint small">
+          Vision models only, e.g. Gemini Flash, GPT-6.1, qwen2.5vl. Vision is app-wide, not
+          per-profile.
+        </p>
         <label className="field">
           <span>Code language</span>
           <select
@@ -1860,15 +2987,6 @@ function Settings({
             <option value="cpp">C++</option>
           </select>
         </label>
-        <label className="check">
-          <input
-            type="checkbox"
-            checked={draft.llm.vision}
-            onChange={(e) => setLlm('vision', e.target.checked)}
-          />
-          <span>Model supports images (needed for screenshots in answers)</span>
-        </label>
-        <p className="hint small">Vision models only, e.g. qwen2.5vl, llava, gpt-4o.</p>
 
         <h3>Answer style</h3>
         <div className="grid2">
@@ -1922,6 +3040,21 @@ function Settings({
           />
           <span>Allow natural filler words (sounds less scripted)</span>
         </label>
+
+        <div className="answer-preview">
+          <div className="answer-preview-head">
+            <span className="label">Answer preview</span>
+            <span className="hint small">Static sample — no model call</span>
+          </div>
+          <div className="answer-preview-sample">
+            <span className="label">Behavioral</span>
+            <pre className="answer-preview-body">{sampleBehavioral(draft.answer)}</pre>
+          </div>
+          <div className="answer-preview-sample">
+            <span className="label">Coding · {draft.answer.codeLanguage}</span>
+            <pre className="answer-preview-body code">{sampleCoding(draft.answer)}</pre>
+          </div>
+        </div>
 
         <h3>Speech-to-text</h3>
         <label className="field">
@@ -2046,8 +3179,7 @@ function Settings({
             onChange={(e) => setMeetings('detect', e.target.checked)}
           />
           <span>
-            Detect meeting apps (Zoom, Teams, Webex, Discord, Slack, Chime, Lark, WhatsApp) and show
-            a tray notification
+            Detect meeting apps (Zoom, Teams, Webex, Discord, Slack, Chime, Lark, WhatsApp)
           </span>
         </label>
         <label className="check">
@@ -2057,6 +3189,14 @@ function Settings({
             onChange={(e) => setMeetings('autoStart', e.target.checked)}
           />
           <span>Start listening automatically when a meeting is detected</span>
+        </label>
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={draft.meetings.balloon}
+            onChange={(e) => setMeetings('balloon', e.target.checked)}
+          />
+          <span>Show meeting-detection notification (visible during screen shares)</span>
         </label>
 
         <h3>Updates (optional)</h3>
@@ -2205,7 +3345,15 @@ function Settings({
             min="1000"
             max="30000"
             value={draft.interaction.answerCooldownMs}
-            onChange={(e) => setInteraction('answerCooldownMs', Number(e.target.value))}
+            onChange={(e) => {
+              // Clamp in the draft so the field never shows a value main will
+              // silently clamp on save (same 1000–30000 bounds).
+              const next = Math.round(Number(e.target.value))
+              setInteraction(
+                'answerCooldownMs',
+                Number.isFinite(next) ? Math.min(30000, Math.max(1000, next)) : 5000
+              )
+            }}
           />
         </label>
 
