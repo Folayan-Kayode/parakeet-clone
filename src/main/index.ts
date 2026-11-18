@@ -155,6 +155,8 @@ let alwaysOnNotified = false
 // Renderer-reported capture state; balloons are suppressed while listening.
 let rendererListening = false
 let updateTimer: ReturnType<typeof setInterval> | null = null
+// Version currently downloading/downloaded, used to label progress events.
+let updateVersion: string | null = null
 // Set when an enabled feed is not https; surfaced by updates:check.
 let updateFeedError: string | null = null
 // Set when config.json failed to parse and was renamed aside (surfaced once).
@@ -1458,17 +1460,29 @@ function registerIpc(): void {
     }
     try {
       const result = await autoUpdater.checkForUpdates()
-      return { ok: true, version: result?.updateInfo?.version ?? null }
+      const version = result?.updateInfo?.version ?? null
+      // A newer version starts downloading automatically; push the first
+      // state immediately so a manual check is visible even before progress.
+      if (version && version !== app.getVersion()) {
+        updateVersion = version
+        sendUpdateState({ status: 'downloading', percent: 0, version })
+      }
+      return { ok: true, version }
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) }
     }
   })
 
   ipcMain.handle('updates:install', () => {
+    // Never restart out from under a live session: the renderer disables the
+    // install button while listening, and main refuses too so a stray invoke
+    // cannot bypass the save-before-quit handshake.
+    if (rendererListening) return false
     // Update restart must not wait on a transcript save prompt.
     quitReady = true
     clearQuitWaitTimer()
     autoUpdater.quitAndInstall()
+    return true
   })
 
   ipcMain.handle('llm:chat', async (event, req: ChatRequest) => {
@@ -1885,6 +1899,17 @@ function applyMeetingConfig(): void {
   else stopMeetingDetector()
 }
 
+// One push for the whole update lifecycle, so the banner and Settings show the
+// same state (downloading %, ready, or a surfaced download error).
+function sendUpdateState(state: {
+  status: 'idle' | 'downloading' | 'ready' | 'error'
+  percent?: number
+  version?: string
+  errorMessage?: string
+}): void {
+  if (win && !win.isDestroyed()) win.webContents.send('update-state-changed', state)
+}
+
 function setupUpdates(): void {
   if (updateTimer) {
     clearInterval(updateTimer)
@@ -1892,6 +1917,7 @@ function setupUpdates(): void {
   }
   if (!config.updates.enabled || !config.updates.feedUrl) {
     updateFeedError = null
+    sendUpdateState({ status: 'idle' })
     return
   }
   // Unsigned updates over plain http are the last unguarded link in the update
@@ -1918,11 +1944,37 @@ function setupUpdates(): void {
     return
   }
   autoUpdater.autoDownload = true
+  // setupUpdates() runs on every config save; drop stale handlers first so the
+  // renderer never receives duplicate state pushes.
+  autoUpdater.removeAllListeners('update-available')
+  autoUpdater.removeAllListeners('download-progress')
   autoUpdater.removeAllListeners('update-downloaded')
+  autoUpdater.removeAllListeners('error')
+  autoUpdater.on('update-available', (info) => {
+    updateVersion = info.version
+    sendUpdateState({ status: 'downloading', percent: 0, version: info.version })
+  })
+  autoUpdater.on('download-progress', (progress) => {
+    sendUpdateState({
+      status: 'downloading',
+      percent: Math.round(progress.percent),
+      version: updateVersion ?? undefined
+    })
+  })
   autoUpdater.on('update-downloaded', (info) => {
+    updateVersion = info.version
+    sendUpdateState({ status: 'ready', version: info.version })
     if (win && !win.isDestroyed()) {
       win.webContents.send('update:ready', { version: info.version })
     }
+  })
+  // Download/check failures used to die in the console; surface them in the UI.
+  autoUpdater.on('error', (err) => {
+    console.error('[updates] updater error', err)
+    sendUpdateState({
+      status: 'error',
+      errorMessage: (err instanceof Error ? err.message : String(err)).slice(0, 160)
+    })
   })
   const check = (): void => {
     autoUpdater.checkForUpdates().catch((err) => console.error('Update check failed', err))

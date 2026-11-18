@@ -27,6 +27,7 @@ import {
 } from '../../shared/question-heuristics'
 import HistoryView, { type SessionData, type SessionSummary } from './HistoryView'
 import SettingsView from './SettingsView'
+import type { UpdateState } from '../../preload/index'
 import {
   AudioEngine,
   startMicStream,
@@ -431,6 +432,8 @@ export default function App() {
   const [corruptBackup, setCorruptBackup] = useState<string | null>(null)
   const [corruptBannerDismissed, setCorruptBannerDismissed] = useState(false)
   const [updateReady, setUpdateReady] = useState<{ version: string } | null>(null)
+  const [updateState, setUpdateState] = useState<UpdateState>({ status: 'idle' })
+  const [updateBannerDismissed, setUpdateBannerDismissed] = useState(false)
   const [regionShot, setRegionShot] = useState<{ dataUrl: string; displayId: number } | null>(null)
   const [regionSel, setRegionSel] = useState<{ x: number; y: number; w: number; h: number } | null>(
     null
@@ -523,6 +526,14 @@ export default function App() {
     if (toastTimer.current) window.clearTimeout(toastTimer.current)
     toastTimer.current = window.setTimeout(() => setToast(null), 2600)
   }, [])
+
+  // Main also refuses to install while a session is live; a false result means
+  // the call raced the listening guard, so explain instead of doing nothing.
+  const installUpdate = useCallback((): void => {
+    void window.api.installUpdate().then((started) => {
+      if (!started) showToast('End your session first — installing restarts the app')
+    })
+  }, [showToast])
 
   // Peak-hold meter painted directly on the DOM: the audio callback runs ~4x/s
   // and must not re-render the whole app. rAF stops once both peaks decay.
@@ -690,8 +701,25 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    const off = window.api.onUpdateReady((payload) => setUpdateReady(payload))
-    return off
+    const offReady = window.api.onUpdateReady((payload) => {
+      setUpdateReady(payload)
+      setUpdateBannerDismissed(false)
+    })
+    // The same subscription feeds the Home/live banner and Settings, so a user
+    // who checked for updates and navigated away still sees progress/readiness.
+    const offState = window.api.onUpdateState((next) => {
+      setUpdateState(next)
+      if (next.status === 'downloading') setUpdateReady(null)
+      if (next.status === 'ready') {
+        if (next.version) setUpdateReady({ version: next.version })
+        setUpdateBannerDismissed(false)
+      }
+      if (next.status === 'error') setUpdateBannerDismissed(false)
+    })
+    return () => {
+      offReady()
+      offState()
+    }
   }, [])
 
   // Dismiss whichever chip menu is open on an outside pointerdown or Escape.
@@ -2006,11 +2034,58 @@ export default function App() {
             (scripts\start-whisper.ps1) <span className="dismiss">×</span>
           </div>
         )}
-        {updateReady && (
-          <div className="banner info">
-            Update {updateReady.version} downloaded —{' '}
-            <button className="btn tiny" onClick={() => void window.api.installUpdate()}>
-              Restart & install
+        {view === 'home' &&
+          !updateReady &&
+          !updateBannerDismissed &&
+          updateState.status === 'downloading' && (
+            <div className="banner info">
+              Downloading update{updateState.version ? ` ${updateState.version}` : ''}…{' '}
+              {updateState.percent ?? 0}%
+            </div>
+          )}
+        {(view === 'home' || view === 'live') &&
+          !updateBannerDismissed &&
+          updateState.status === 'error' && (
+            <div className="banner error update-banner">
+              <span>Update failed: {updateState.errorMessage ?? 'unknown error'}</span>
+              <button
+                className="icon-btn"
+                title="Dismiss"
+                onClick={() => setUpdateBannerDismissed(true)}
+              >
+                ×
+              </button>
+            </div>
+          )}
+        {(view === 'home' || view === 'live') && updateReady && !updateBannerDismissed && (
+          <div className="banner info update-banner">
+            <span>
+              Parakeet Clone {updateReady.version} is ready — Restart &amp; install
+              {listening && (
+                <span className="hint small">
+                  {' '}
+                  End your session first — installing restarts the app
+                </span>
+              )}
+            </span>
+            <button
+              className="btn tiny"
+              disabled={listening}
+              title={
+                listening
+                  ? 'End your session first — installing restarts the app'
+                  : 'Restart and install the update'
+              }
+              onClick={installUpdate}
+            >
+              Install now
+            </button>
+            <button
+              className="icon-btn"
+              title="Dismiss"
+              onClick={() => setUpdateBannerDismissed(true)}
+            >
+              ×
             </button>
           </div>
         )}
@@ -2511,6 +2586,9 @@ export default function App() {
             newId={uid}
             errorMessage={errorMessage}
             runCaptureChecks={runRendererCaptureChecks}
+            updateState={updateState}
+            updateReady={updateReady}
+            listening={listening}
             onToast={showToast}
             onSave={async (draft) => {
               const next = await window.api.setConfig({

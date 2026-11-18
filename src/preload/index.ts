@@ -1,6 +1,15 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import type { AppConfig, CaptureTestReport, ChatRequest, HotkeyInfo } from '../shared/types'
 
+/** Push from main for the whole update lifecycle (banner + Settings). */
+export interface UpdateState {
+  status: 'idle' | 'downloading' | 'ready' | 'error'
+  /** 0–100 while downloading. */
+  percent?: number
+  version?: string
+  errorMessage?: string
+}
+
 const api = {
   getConfig: (): Promise<{ config: AppConfig; corruptBackupPath: string | null }> =>
     ipcRenderer.invoke('config:get'),
@@ -51,11 +60,16 @@ const api = {
   exportSession: (name: string): Promise<string> => ipcRenderer.invoke('sessions:export', name),
   checkForUpdates: (): Promise<{ ok: boolean; version?: string | null; error?: string }> =>
     ipcRenderer.invoke('updates:check'),
-  installUpdate: (): Promise<void> => ipcRenderer.invoke('updates:install'),
+  installUpdate: (): Promise<boolean> => ipcRenderer.invoke('updates:install'),
   onUpdateReady: (cb: (payload: { version: string }) => void): (() => void) => {
     const handler = (_e: unknown, payload: { version: string }): void => cb(payload)
     ipcRenderer.on('update:ready', handler as never)
     return () => ipcRenderer.removeListener('update:ready', handler as never)
+  },
+  onUpdateState: (cb: (state: UpdateState) => void): (() => void) => {
+    const handler = (_e: unknown, state: UpdateState): void => cb(state)
+    ipcRenderer.on('update-state-changed', handler as never)
+    return () => ipcRenderer.removeListener('update-state-changed', handler as never)
   },
   chat: (req: ChatRequest): Promise<{ ok: boolean; text: string }> =>
     ipcRenderer.invoke('llm:chat', req),

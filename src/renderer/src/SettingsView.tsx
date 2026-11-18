@@ -12,6 +12,7 @@ import type {
 } from '../../shared/types'
 import { buildAnswerPreview } from '../../shared/answer-preview'
 import { INTERACTION_BOUNDS, LLM_BOUNDS, clampInteractionValue } from '../../shared/clamps'
+import type { UpdateState } from '../../preload/index'
 
 function formatAccelerator(accelerator: string): string {
   return accelerator.replace(/CommandOrControl/g, 'Ctrl')
@@ -70,6 +71,12 @@ export interface SettingsViewProps {
   errorMessage: (err: unknown) => string
   /** Renderer-side capture checks, run from the existing app scope. */
   runCaptureChecks: () => Promise<CaptureTestCheck[]>
+  /** Live update lifecycle pushed from main (downloading / ready / error). */
+  updateState: UpdateState
+  /** Set once a downloaded update is waiting to install. */
+  updateReady: { version: string } | null
+  /** Installing restarts the app, so it is blocked while a session is live. */
+  listening: boolean
   onToast: (message: string) => void
   onSave: (draft: AppConfig) => Promise<void>
   onBack: () => void
@@ -82,6 +89,9 @@ export default function SettingsView({
   newId,
   errorMessage,
   runCaptureChecks,
+  updateState,
+  updateReady,
+  listening,
   onToast,
   onSave,
   onBack,
@@ -786,6 +796,42 @@ export default function SettingsView({
             Feed must host electron-builder artifacts (latest.yml + installer).
           </span>
         </div>
+        {updateState.status === 'downloading' && (
+          <p className="hint small">
+            Downloading{updateState.version ? ` ${updateState.version}` : ''}…{' '}
+            {updateState.percent ?? 0}%
+          </p>
+        )}
+        {updateState.status === 'error' && (
+          <p className="hint small update-error">
+            Update failed: {updateState.errorMessage ?? 'unknown error'}
+          </p>
+        )}
+        {updateReady && (
+          <div className="row gap">
+            <button
+              className="btn"
+              disabled={listening}
+              title={
+                listening
+                  ? 'End your session first — installing restarts the app'
+                  : 'Restart and install the update'
+              }
+              onClick={() => {
+                void window.api.installUpdate().then((started) => {
+                  if (!started) onToast('End your session first — installing restarts the app')
+                })
+              }}
+            >
+              Install {updateReady.version}
+            </button>
+            {listening && (
+              <span className="hint small">
+                End your session first — installing restarts the app
+              </span>
+            )}
+          </div>
+        )}
 
         <h3>Connections</h3>
         <div className="row gap">

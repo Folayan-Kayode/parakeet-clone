@@ -357,8 +357,10 @@ visible (on the shared screen) only while that setting is enabled.
 
 Host electron-builder artifacts (installer + `latest.yml`) on any static HTTPS location, then set
 *Settings → Updates → Feed URL*. The app checks on launch and every 6 hours, downloads in the
-background, and shows a "Restart & install" banner when ready. Only point the feed at HTTPS
-endpoints you control — updates are not signature-verified.
+background, and shows a "Restart & install" banner when ready. After **Check now** finds an update,
+it downloads automatically in the background; a banner appears when it's ready to install. Install
+is blocked while a session is listening (installing restarts the app). Only point the feed at
+HTTPS endpoints you control — updates are not signature-verified.
 
 
 ## Known v1 limitations

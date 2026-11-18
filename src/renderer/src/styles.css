@@ -124,6 +124,28 @@ body {
   opacity: 0.7;
 }
 
+/* Update banner: message + Install now + dismiss, wrapping on narrow panels. */
+.update-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.update-banner > span:first-child {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.update-banner .icon-btn {
+  margin-left: auto;
+  background: transparent;
+}
+
+.update-error {
+  color: #fca5a5;
+}
+
 .home {
   padding: 8px 16px 16px;
   display: flex;
