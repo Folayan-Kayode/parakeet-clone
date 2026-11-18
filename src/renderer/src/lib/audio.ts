@@ -1,16 +1,8 @@
+import { VAD_DEFAULTS, VadMachine, type VadDecision } from './vad'
+
 export type Speaker = 'You' | 'Them'
 
 const TARGET_SAMPLE_RATE = 16000
-const SILENCE_MS = 900
-const MIN_SPEECH_MS = 500
-const MAX_CHUNK_MS = 12000
-const MAX_PREROLL_MS = 900
-const PARTIAL_INTERVAL_MS = 800
-const MIN_PARTIAL_SPEECH_MS = 900
-// 300 ms at 16 kHz: tolerate normal callback jitter, bridge longer stalls.
-const GAP_TOLERANCE_SAMPLES = 4800
-// Never synthesize more than 2 s in one burst; resync instead (see process()).
-const MAX_INJECTED_GAP_SAMPLES = 32000
 // Capture frames: 160 samples = 10 ms at the 16 kHz context.
 const WORKLET_FRAME_SAMPLES = 160
 const WORKLET_PROCESSOR_NAME = 'parakeet-vad-framer'
@@ -126,37 +118,33 @@ export class AudioEngine {
   private worklet: AudioWorkletNode | null = null
   private sink: GainNode | null = null
   private stream: MediaStream | null = null
-  private frames: Float32Array[] = []
-  // Worklet frames awaiting a full legacy-sized batch (see handleWorkletFrame).
-  private pendingFrames: Float32Array[] = []
-  private pendingSamples = 0
-  private preBuffer: Float32Array[] = []
-  private preBufferSamples = 0
-  private voicedStreak = 0
-  private speechMs = 0
-  private lastVoiceAt = 0
-  private speaking = false
-  private noiseFloor = 0.004
-
-  private utteranceId = 0
-  private lastPartialAt = 0
-
-  // Wall-clock sample accounting. Any lossy delivery path (ScriptProcessor
-  // callbacks paused under main-thread jank, or a jammed worklet port) can drop
-  // samples; bounded silence (the SilencePacer idea) keeps VAD and silence
-  // timing true to elapsed time instead of stretching an utterance. With the
-  // AudioWorklet path this is a safety net that should almost never trigger.
-  private clockStart = 0
-  private expectedSamples = 0
-  private receivedSamples = 0
+  private readonly machine: VadMachine
 
   constructor(
     private readonly speaker: Speaker,
     private readonly onSegment: (speaker: Speaker, wav: ArrayBuffer, utteranceId: number) => void,
-    private readonly onLevel: (level: number) => void,
+    private readonly onLevel: (speaker: Speaker, rms: number) => void,
     private readonly onPartial: (speaker: Speaker, wav: ArrayBuffer, utteranceId: number) => void,
-    private readonly silenceMs: number = SILENCE_MS
-  ) {}
+    private readonly silenceMs: number = VAD_DEFAULTS.silenceMs,
+    private readonly onWarning?: (message: string) => void
+  ) {
+    this.machine = new VadMachine({
+      silenceMs: this.silenceMs,
+      maxChunkMs: VAD_DEFAULTS.maxChunkMs,
+      prerollMs: VAD_DEFAULTS.prerollMs,
+      minSpeechMs: VAD_DEFAULTS.minSpeechMs,
+      partialIntervalMs: VAD_DEFAULTS.partialIntervalMs,
+      minPartialSpeechMs: VAD_DEFAULTS.minPartialSpeechMs,
+      sampleRate: TARGET_SAMPLE_RATE,
+      noiseFloorMin: VAD_DEFAULTS.noiseFloorMin,
+      noiseFloorInitial: VAD_DEFAULTS.noiseFloorInitial,
+      gapToleranceSamples: VAD_DEFAULTS.gapToleranceSamples,
+      maxInjectedGapSamples: VAD_DEFAULTS.maxInjectedGapSamples,
+      batchSamples: SCRIPT_PROCESSOR_FRAME,
+      minChunkRms: VAD_DEFAULTS.minChunkRms,
+      now: () => performance.now()
+    })
+  }
 
   async startWithStream(stream: MediaStream): Promise<void> {
     this.stop()
@@ -165,9 +153,15 @@ export class AudioEngine {
     this.stream = stream
 
     const ctx = new AudioContext({ sampleRate: TARGET_SAMPLE_RATE, latencyHint: 'interactive' })
+    // Assign immediately: any later await/throw must be closable via stop(),
+    // which only knows about this.ctx.
+    this.ctx = ctx
     // Context first, then the module: a load failure only downgrades this
     // stream, and the compile finishes before the first buffer arrives.
     const workletReady = await loadWorkletModule(ctx)
+    if (!workletReady) {
+      this.onWarning?.('Audio worklet unavailable — using legacy capture (still works)')
+    }
     await ctx.resume()
     const source = ctx.createMediaStreamSource(new MediaStream([track]))
     const sink = ctx.createGain()
@@ -194,6 +188,7 @@ export class AudioEngine {
         console.log(
           `[audio] worklet module unavailable — falling back to ScriptProcessor: ${errorText(err)}`
         )
+        this.onWarning?.('Audio worklet unavailable — using legacy capture (still works)')
         worklet = null
       }
     }
@@ -204,7 +199,7 @@ export class AudioEngine {
       const processor = ctx.createScriptProcessor(SCRIPT_PROCESSOR_FRAME, 1, 1)
 
       processor.onaudioprocess = (event): void => {
-        this.process(event.inputBuffer.getChannelData(0))
+        this.consume(this.machine.feed(event.inputBuffer.getChannelData(0)))
       }
 
       source.connect(processor)
@@ -223,141 +218,31 @@ export class AudioEngine {
   }
 
   /**
-   * Worklet frames arrive as 10 ms transferables. Batching back up to the
-   * legacy 4096-sample callbacks keeps VAD cadence, partial timing and gap
-   * accounting bit-for-bit identical to the ScriptProcessor path (process()
-   * itself is size-agnostic, but batching avoids 25x more VAD updates).
+   * Worklet frames arrive as 10 ms transferables. The VAD machine accumulates
+   * them back to the legacy 4096-sample cadence, so VAD decisions, partial
+   * timing and gap accounting match the ScriptProcessor path.
    */
   private handleWorkletFrame(frame: Float32Array): void {
-    if (frame.length === 0) return
-    this.pendingFrames.push(frame)
-    this.pendingSamples += frame.length
-    if (this.pendingSamples < SCRIPT_PROCESSOR_FRAME) return
-
-    const batch = new Float32Array(this.pendingSamples)
-    let offset = 0
-    for (const part of this.pendingFrames) {
-      batch.set(part, offset)
-      offset += part.length
-    }
-    this.pendingFrames = []
-    this.pendingSamples = 0
-    this.process(batch)
+    this.consume(this.machine.feed(frame))
   }
 
-  private push(data: Float32Array): void {
-    this.frames.push(new Float32Array(data))
-    this.speechMs += (data.length / TARGET_SAMPLE_RATE) * 1000
-  }
-
-  private process(data: Float32Array): void {
-    const now = performance.now()
-    if (!this.clockStart) {
-      // Anchor to the start of the first buffer so its samples are not a gap.
-      this.clockStart = now - (data.length / TARGET_SAMPLE_RATE) * 1000
-    }
-    this.expectedSamples = Math.round(
-      ((now - this.clockStart) / 1000) * TARGET_SAMPLE_RATE
-    )
-    this.receivedSamples += data.length
-    const gap = this.expectedSamples - this.receivedSamples
-    if (gap > GAP_TOLERANCE_SAMPLES) {
-      this.receivedSamples = this.expectedSamples
-      // Zero samples only matter inside an utterance (silence/VAD timing).
-      // When idle, or after a multi-second stall, just resync the baseline.
-      if (this.speaking && gap <= MAX_INJECTED_GAP_SAMPLES) {
-        this.feed(new Float32Array(gap), now)
+  /** Encode and deliver machine decisions in the order they were produced. */
+  private consume(decisions: VadDecision[]): void {
+    for (const decision of decisions) {
+      if (decision.type === 'level') {
+        this.onLevel(this.speaker, decision.rms)
+      } else if (decision.type === 'partial') {
+        this.onPartial(this.speaker, encodeWav([decision.samples]), decision.uid)
+      } else if (decision.type === 'final') {
+        this.onSegment(this.speaker, encodeWav([decision.samples]), decision.uid)
       }
-    }
-    this.feed(data, now)
-  }
-
-  private feed(data: Float32Array, now: number): void {
-    let sum = 0
-    for (let i = 0; i < data.length; i++) sum += data[i] * data[i]
-    const rms = Math.sqrt(sum / data.length)
-    this.onLevel(rms)
-
-    const threshold = Math.max(0.008, this.noiseFloor * 2.5)
-    const voiced = rms > threshold
-
-    if (!this.speaking) {
-      this.preBuffer.push(new Float32Array(data))
-      this.preBufferSamples += data.length
-      while (
-        this.preBufferSamples / TARGET_SAMPLE_RATE > MAX_PREROLL_MS / 1000 &&
-        this.preBuffer.length > 0
-      ) {
-        const dropped = this.preBuffer.shift()
-        this.preBufferSamples -= dropped?.length ?? 0
-      }
-      if (voiced) {
-        this.voicedStreak += 1
-        if (this.voicedStreak >= 2) {
-          this.speaking = true
-          this.utteranceId += 1
-          this.lastPartialAt = now
-          this.frames = this.preBuffer
-          this.speechMs = (this.preBufferSamples / TARGET_SAMPLE_RATE) * 1000
-          this.preBuffer = []
-          this.preBufferSamples = 0
-          this.lastVoiceAt = now
-        }
-      } else {
-        this.voicedStreak = 0
-        this.noiseFloor = this.noiseFloor * 0.98 + rms * 0.02
-      }
-      return
-    }
-
-    this.push(data)
-    if (voiced) this.lastVoiceAt = now
-
-    if (
-      this.speechMs >= MIN_PARTIAL_SPEECH_MS &&
-      now - this.lastPartialAt >= PARTIAL_INTERVAL_MS
-    ) {
-      this.lastPartialAt = now
-      if (this.frames.length > 0) {
-        this.onPartial(this.speaker, encodeWav(this.frames), this.utteranceId)
-      }
-    }
-
-    if (this.speechMs >= MAX_CHUNK_MS) {
-      this.flush(true)
-    } else if (now - this.lastVoiceAt > this.silenceMs) {
-      this.flush(false)
+      // speech-start has no engine callback.
     }
   }
 
-  private flush(keepSpeaking: boolean): void {
-    const frames = this.frames
-    const speechMs = this.speechMs
-    this.frames = []
-    this.speechMs = 0
-    this.speaking = keepSpeaking
-    this.voicedStreak = 0
-    if (!keepSpeaking) this.lastVoiceAt = 0
-    if (speechMs < MIN_SPEECH_MS || frames.length === 0) return
-
-    let sum = 0
-    let count = 0
-    for (const frame of frames) {
-      for (let i = 0; i < frame.length; i++) {
-        sum += frame[i] * frame[i]
-        count++
-      }
-    }
-    const chunkRms = count > 0 ? Math.sqrt(sum / count) : 0
-    if (chunkRms < 0.01) return
-
-    const wav = encodeWav(frames)
-    const uid = this.utteranceId
-    this.onSegment(this.speaker, wav, uid)
-    if (keepSpeaking) {
-      this.utteranceId += 1
-      this.lastPartialAt = performance.now()
-    }
+  /** Samples/batches since start, for lifecycle diagnostics. */
+  getStats(): { batches: number; samples: number; durationMs: number } {
+    return this.machine.getStats()
   }
 
   stop(): void {
@@ -383,17 +268,7 @@ export class AudioEngine {
     this.worklet = null
     this.sink = null
     this.stream = null
-    this.frames = []
-    this.pendingFrames = []
-    this.pendingSamples = 0
-    this.preBuffer = []
-    this.preBufferSamples = 0
-    this.speechMs = 0
-    this.voicedStreak = 0
-    this.speaking = false
-    this.clockStart = 0
-    this.expectedSamples = 0
-    this.receivedSamples = 0
+    this.machine.reset()
   }
 }
 

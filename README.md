@@ -30,6 +30,8 @@ are copied. Runs your own speech-to-text and your own LLM (local or API).
 - Transcribes the remote side from Windows system-audio loopback ("Them"). Microphone
   transcription ("You") is optional in Settings (off by default to avoid echo and Whisper
   hallucinations from room noise).
+- Live You/Them level meters make loopback silence visible; 20 s of a flat Them bar raises a
+  one-time "No system audio detected" toast.
 - Live partial transcripts: text updates while the person is still speaking (~800 ms cadence),
   then a final polished segment replaces it on end-of-utterance.
 - Sticky-bottom auto-scroll (toggle in Settings): follows new transcript and answers while you
@@ -41,6 +43,8 @@ are copied. Runs your own speech-to-text and your own LLM (local or API).
   answer
 - Segments speech with a lightweight VAD and transcribes each chunk
 - Streams answers from any OpenAI-compatible chat endpoint (Ollama, LM Studio, OpenRouter, OpenAI…)
+- A hung model endpoint fails fast instead of deadlocking: no response within 60s + 5s per attached
+  image (max 120s) aborts the ask with an actionable message
 - Saved model profiles (each with its own endpoint, key and sampling) and a live-view switcher;
   switching applies to the next question without a restart
 - Screenshot attachment for vision-capable models
@@ -111,15 +115,17 @@ instructions.
 - The company and vocabulary are prepended to the Whisper prompt; the recent transcript carry-over
   fills the remainder of the 700-character budget.
 
-Sessions save transcripts, answers and the 10 most recent screenshots (thumbnails appear under
-their answers in History). Each saved image is captured at 1600x900 JPEG q85 (typically well under
-1 MB). Answers whose question segment was not captured get a `(question not captured)` placeholder
-at save time so Q→A pairing survives.
+Sessions save every retained transcript segment and answer (up to the 2,000-row in-memory
+caps) and the 10 most recent screenshots (thumbnails appear under their answers in History). Each
+saved image is captured at 1600x900 JPEG q85 (typically well under 1 MB). Answers whose question
+segment was not captured get a `(question not captured)` placeholder at save time so Q→A pairing
+survives.
 
 While listening, the live transcript is snapshotted to `autosave.json` every 2 minutes (offered for
 recovery in History). Closing the window or quitting mid-session saves the transcript first. End is
 idempotent — pressing it twice, or End then Alt+F4, writes one session file and clears the live
-transcript for the next session.
+transcript for the next session. If the save fails, End keeps the live transcript visible so it can
+be retried; quitting still exits via the autosave fallback.
 
 ## Models
 
@@ -307,6 +313,13 @@ The overlay is hidden from screen sharing/recording with Electron's
 `screen-saver` level, and uses `disable-features=CalculateNativeWinOcclusion` so Chromium keeps
 painting when occluded.
 
+### Operational flags
+
+- `PC_VERBOSE=1` — environment variable; restores interview-content logging to stdout for
+  debugging (transcript and answer content is redacted by default).
+- `audio.useWorklet` — `config.json` field; set `false` to fall back to the legacy ScriptProcessor
+  capture if the AudioWorklet misbehaves. The app logs which capture path is active at startup.
+
 ## Build an installer
 
 ```powershell
@@ -361,7 +374,8 @@ endpoints you control — updates are not signature-verified.
 - Job-link fetching is best-effort: LinkedIn and other login-walled pages usually refuse it — paste
   the description manually.
 - Attachments are consumed and cleared after sending, so regenerating an old answer cannot include
-  the original screenshots.
+  the original screenshots. Structured coding answers keep the JSON contract on Regenerate, so the
+  card returns without re-attaching the image.
 - Question detection is a heuristic (question mark / interrogative start / known interview
   phrases); Auto Answer is off by default.
 - Screenshot answers require a vision-capable model (enable "Active model supports images" in

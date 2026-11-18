@@ -7,7 +7,8 @@ import { clip } from './whisper-prompt'
 export function buildSystemPrompt(
   cfg: AppConfig,
   hasImageAttachment: boolean,
-  qType: ResolvedQuestionType
+  qType: ResolvedQuestionType,
+  keepStructured = false
 ): string {
   const a = cfg.answer
   const lengthRule =
@@ -73,7 +74,14 @@ export function buildSystemPrompt(
           '- Else: fall back to the normal spoken-answer style.',
           'These image rules take precedence over the Style word budget above.'
         ].join('\n')
-    : ''
+    : keepStructured && qType === 'coding'
+      ? [
+          'The question requires a coded solution. Respond with ONLY a JSON object and no other text, using exactly this shape:',
+          `{"approach": "<=2 sentence first-person approach", "key_steps": ["..."], "code": {"language": "${a.codeLanguage}", "source": "..."}, "complexity": {"time": "...", "space": "..."}}`,
+          `Fill "approach" with at most two spoken-style first-person sentences. "key_steps" lists the algorithm steps in order. "code.source" is the complete, correct, runnable ${a.codeLanguage} solution, with NO markdown fences inside the JSON string. "complexity" gives big-O time and space. No trailing questions, offers, or meta commentary.`,
+          'This protocol takes precedence over the Style word budget above.'
+        ].join('\n')
+      : ''
 
   return [
     "You are the user's live interview copilot. Your job: give a direct, speakable answer to the latest question in the call transcript.",

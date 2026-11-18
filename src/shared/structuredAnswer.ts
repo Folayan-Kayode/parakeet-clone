@@ -60,6 +60,12 @@ function longestBacktickRun(text: string): number {
   return longest
 }
 
+// Fence info strings are single-token: strip newlines/backticks/spaces so a
+// model-supplied language cannot close the fence early. Empty means no suffix.
+export function sanitizeFenceLanguage(language: string): string {
+  return language.replace(/[^A-Za-z0-9+#.\-]/g, '')
+}
+
 // Markdown rendering for session export; `fallback` is returned when the answer
 // did not parse as the structured contract.
 export function structuredAnswerMarkdown(
@@ -75,7 +81,8 @@ export function structuredAnswerMarkdown(
   }
   if (card.code.source) {
     const fence = '`'.repeat(Math.max(3, longestBacktickRun(card.code.source) + 1))
-    lines.push(`${fence}${card.code.language}`, card.code.source, fence, '')
+    const language = sanitizeFenceLanguage(card.code.language)
+    lines.push(`${fence}${language}`, card.code.source, fence, '')
   }
   const complexity = [
     card.complexity.time && `time ${card.complexity.time}`,

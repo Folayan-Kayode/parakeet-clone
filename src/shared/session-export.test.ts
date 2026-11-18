@@ -88,6 +88,35 @@ describe('buildSessionMarkdown', () => {
     expect(markdown).not.toContain('> {')
   })
 
+  it('sanitizes a fence language containing newlines and backticks', () => {
+    const card = {
+      approach: 'Keep the fence intact.',
+      key_steps: [],
+      code: { language: 'py\n```\nthon', source: 'print(1)' },
+      complexity: { time: '', space: '' }
+    }
+    const markdown = buildSessionMarkdown(
+      { answers: [{ text: JSON.stringify(card) }] },
+      'T'
+    )
+    expect(markdown).toContain('```python\nprint(1)\n```')
+    expect(markdown).not.toContain('```py\n')
+  })
+
+  it('omits the fence language when sanitization leaves nothing', () => {
+    const card = {
+      approach: 'No language.',
+      key_steps: [],
+      code: { language: '```\n', source: 'print(1)' },
+      complexity: { time: '', space: '' }
+    }
+    const markdown = buildSessionMarkdown(
+      { answers: [{ text: JSON.stringify(card) }] },
+      'T'
+    )
+    expect(markdown).toContain('```\nprint(1)\n```')
+  })
+
   it('falls back to the exportedAt default when endedAt is missing', () => {
     const markdown = buildSessionMarkdown({}, 'FIXED-TIMESTAMP')
     expect(markdown).toBe(

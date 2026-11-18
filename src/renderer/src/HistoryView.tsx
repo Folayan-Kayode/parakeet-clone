@@ -23,6 +23,7 @@ export interface SessionData {
     error?: string
     question?: string
     anchorId?: string
+    card?: StructuredAnswer
     images?: string[]
   }>
 }
@@ -103,7 +104,7 @@ export default function HistoryView({
                 images: answer.images,
                 card: answer.error
                   ? undefined
-                  : parseStructuredAnswer(answer.text ?? '') ?? undefined
+                  : answer.card ?? parseStructuredAnswer(answer.text ?? '') ?? undefined
               })
               segments.forEach((segment, index) => {
                 items.push({

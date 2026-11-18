@@ -38,13 +38,15 @@ import {
   activeProfile,
   buildChatMessages,
   chatBody,
-  clampAnswerCooldown,
+  computeResponseDeadlineMs,
   coerceWindowBounds,
+  decomposeMessages,
   normalizeAnswer,
   normalizeLlm
 } from './llm-body'
 import { isAlwaysOnApp, isAlwaysOnTitle, meetingTitleHit } from './meeting-detect'
 import { assertPublicHost, normalizeHost, stripHtml } from './ssrf'
+import { clampInteractionValue } from '../shared/clamps'
 
 const execFileAsync = promisify(execFile)
 
@@ -178,27 +180,16 @@ function errorText(err: unknown, max = 160): string {
 }
 
 // 0 disables the coalescing grace window (legacy immediate auto-answer).
-function clampMergeFollowUps(value: unknown): number {
-  if (typeof value !== 'number' || !Number.isFinite(value)) return 2000
-  return Math.min(5000, Math.max(0, Math.round(value)))
-}
-
-// The AudioEngine needs enough silence to split utterances but not so much that
-// a normal mid-question pause merges across speakers.
-function clampSilenceSplit(value: unknown): number {
-  if (typeof value !== 'number' || !Number.isFinite(value)) return 900
-  return Math.min(1500, Math.max(600, Math.round(value)))
-}
-
+// Bounds live in shared/clamps so SettingsView's inputs cannot drift from main.
 function normalizeInteraction(
   interaction: AppConfig['interaction']
 ): AppConfig['interaction'] {
   if (!isPlainObject(interaction)) return { ...DEFAULT_CONFIG.interaction }
   return {
     ...interaction,
-    answerCooldownMs: clampAnswerCooldown(interaction.answerCooldownMs),
-    mergeFollowUpsMs: clampMergeFollowUps(interaction.mergeFollowUpsMs),
-    silenceSplitMs: clampSilenceSplit(interaction.silenceSplitMs)
+    answerCooldownMs: clampInteractionValue('answerCooldownMs', interaction.answerCooldownMs),
+    mergeFollowUpsMs: clampInteractionValue('mergeFollowUpsMs', interaction.mergeFollowUpsMs),
+    silenceSplitMs: clampInteractionValue('silenceSplitMs', interaction.silenceSplitMs)
   }
 }
 
@@ -1494,10 +1485,13 @@ function registerIpc(): void {
     // The renderer always sends [system, ...assistant turns, user]. `last` is
     // captured before assembly because the multimodal form replaces that turn.
     const last = req.messages[req.messages.length - 1]
+    const { systemPrompt, priorTurns, question } = decomposeMessages(req.messages)
     const messages = buildChatMessages({
-      systemPrompt: req.messages[0]?.content ?? '',
-      priorTurns: req.messages.slice(1, req.messages.length - 1),
-      question: last?.content,
+      systemPrompt,
+      priorTurns,
+      // An empty request has no user turn; the blank question is only the
+      // decomposition's placeholder.
+      question: req.messages.length > 0 ? question.content : undefined,
       images: req.images,
       vision: req.vision
     })
@@ -1513,17 +1507,24 @@ function registerIpc(): void {
 
     let streamIdleTimer: ReturnType<typeof setTimeout> | null = null
     let streamTimedOut = false
-    // A dead endpoint can hang the TCP/TLS connect far longer than the 20s
-    // idle watchdog (which only starts after headers). Cap the pre-header phase
-    // at 15s; the idle watchdog keeps its 20s semantics after that.
-    // The timer is cleared once headers arrive: a live fetch's signal also
-    // governs body streaming, so a remaining 15s timer would cut long answers.
-    const connectCtrl = new AbortController()
-    const connectTimer = setTimeout(
-      () => connectCtrl.abort(new DOMException('Connect timeout', 'TimeoutError')),
-      15_000
-    )
-    const connectSignal = AbortSignal.any([ctrl.signal, connectCtrl.signal])
+    // Anti-deadlock backstop for a hung endpoint (accepts the connection but
+    // never responds) — not a latency budget. Multi-image + deep-thinking asks
+    // legitimately take 20–60s+ to first byte, so the deadline scales with the
+    // payload: 60s base + 5s per image, capped at 120s. The timer is cleared
+    // once headers arrive: a live fetch's signal also governs body streaming,
+    // so a remaining deadline timer would cut long answers.
+    const responseDeadlineMs = computeResponseDeadlineMs(req.images.length)
+    const deadlineCtrl = new AbortController()
+    let deadlineMessage = ''
+    const deadlineTimer = setTimeout(() => {
+      const seconds = Math.round(responseDeadlineMs / 1000)
+      deadlineMessage =
+        req.images.length > 0
+          ? `Model didn't respond within ${seconds}s (${req.images.length} images attached — try fewer or cropped screenshots, or a faster model profile)`
+          : `Model didn't respond within ${seconds}s — check your endpoint`
+      deadlineCtrl.abort(new DOMException('Response deadline exceeded', 'TimeoutError'))
+    }, responseDeadlineMs)
+    const deadlineSignal = AbortSignal.any([ctrl.signal, deadlineCtrl.signal])
     const clearStreamIdleTimer = (): void => {
       if (streamIdleTimer) {
         clearTimeout(streamIdleTimer)
@@ -1536,10 +1537,10 @@ function registerIpc(): void {
       // tokens flow there is no retry, so the user never sees a silent restart.
       const res = await fetchChatWithRetry(
         endpoint,
-        { method: 'POST', headers, body: JSON.stringify(body), signal: connectSignal },
-        ctrl.signal
+        { method: 'POST', headers, body: JSON.stringify(body), signal: deadlineSignal },
+        deadlineSignal
       )
-      clearTimeout(connectTimer)
+      clearTimeout(deadlineTimer)
 
       const stream = res.body
       if (!stream) throw new Error('LLM error: response has no body')
@@ -1590,18 +1591,18 @@ function registerIpc(): void {
       verboseLog(`[llm-answer] ${full}`)
       return { ok: true, text: full }
     } catch (err) {
-      const connectTimedOut = connectCtrl.signal.aborted && !ctrl.signal.aborted
+      const deadlineExceeded = deadlineCtrl.signal.aborted && !ctrl.signal.aborted
       const message = streamTimedOut
         ? 'no response from the model for 20s — check your endpoint'
-        : connectTimedOut
-          ? 'no response from the model within 15s — check your endpoint'
+        : deadlineExceeded && deadlineMessage
+          ? deadlineMessage
           : err instanceof Error
             ? err.message
             : String(err)
       event.sender.send('llm:error', { id: req.id, message })
       throw new Error(message)
     } finally {
-      clearTimeout(connectTimer)
+      clearTimeout(deadlineTimer)
       clearStreamIdleTimer()
       aborters.delete(req.id)
     }
@@ -1800,7 +1801,7 @@ async function pollMeeting(): Promise<void> {
     const titleAlwaysOn = titleHit ? isAlwaysOnTitle(titleHit.title) : false
     const hits = [
       ...processHits.map((name) => ({ label: name, alwaysOn: isAlwaysOnApp(name) })),
-      ...(titleHit ? [{ label: titleHit.title, alwaysOn: titleAlwaysOn }] : [])
+      ...(titleHit ? [{ label: titleHit.label, alwaysOn: titleAlwaysOn }] : [])
     ]
     const nonAlwaysOn = hits.filter((hit) => !hit.alwaysOn)
     // Auto-start needs a confirmed meeting app process or a meeting-specific
@@ -1835,7 +1836,7 @@ async function pollMeeting(): Promise<void> {
       alwaysOnNotified = false
       const signals: string[] = []
       if (processHits.length > 0) signals.push(`process ${processHits.join(', ')}`)
-      if (titleHit) signals.push(`window "${titleHit.title}"`)
+      if (titleHit) signals.push(`window ${titleHit.label}`)
       console.log('[meeting] detected via', signals.join(' + '))
       notify('meeting')
       if (config.meetings.autoStart && autoStartEligible) sendHotkey('autostart')

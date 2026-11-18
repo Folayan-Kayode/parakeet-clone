@@ -11,6 +11,7 @@ import type {
   SpeedBadge
 } from '../../shared/types'
 import { buildAnswerPreview } from '../../shared/answer-preview'
+import { INTERACTION_BOUNDS, LLM_BOUNDS, clampInteractionValue } from '../../shared/clamps'
 
 function formatAccelerator(accelerator: string): string {
   return accelerator.replace(/CommandOrControl/g, 'Ctrl')
@@ -186,7 +187,8 @@ export default function SettingsView({
     omit: boolean
   ): void => {
     if (!omit) {
-      const fallback = key === 'temperature' ? 0.2 : 4096
+      const fallback =
+        key === 'temperature' ? LLM_BOUNDS.temperature.fallback : LLM_BOUNDS.maxTokens.fallback
       setProfileNumber(profile.id, key, lastNumbers[profile.id]?.[key] ?? fallback)
       return
     }
@@ -386,8 +388,8 @@ export default function SettingsView({
                       <input
                         type="number"
                         step="0.05"
-                        min="0"
-                        max="1"
+                        min={LLM_BOUNDS.temperature.min}
+                        max={LLM_BOUNDS.temperature.max}
                         placeholder="omitted"
                         value={profile.temperature ?? ''}
                         onChange={(e) => {
@@ -407,8 +409,8 @@ export default function SettingsView({
                       <input
                         type="number"
                         step="64"
-                        min="128"
-                        max="8192"
+                        min={LLM_BOUNDS.maxTokens.min}
+                        max={LLM_BOUNDS.maxTokens.max}
                         placeholder="omitted"
                         value={profile.maxTokens ?? ''}
                         onChange={(e) => {
@@ -885,16 +887,15 @@ export default function SettingsView({
           <input
             type="number"
             step="500"
-            min="1000"
-            max="30000"
+            min={INTERACTION_BOUNDS.answerCooldownMs.min}
+            max={INTERACTION_BOUNDS.answerCooldownMs.max}
             value={draft.interaction.answerCooldownMs}
             onChange={(e) => {
               // Clamp in the draft so the field never shows a value main will
-              // silently clamp on save (same 1000–30000 bounds).
-              const next = Math.round(Number(e.target.value))
+              // silently clamp on save (shared bounds).
               setInteraction(
                 'answerCooldownMs',
-                Number.isFinite(next) ? Math.min(30000, Math.max(1000, next)) : 5000
+                clampInteractionValue('answerCooldownMs', Number(e.target.value))
               )
             }}
           />
@@ -904,14 +905,13 @@ export default function SettingsView({
           <input
             type="number"
             step="100"
-            min="0"
-            max="5000"
+            min={INTERACTION_BOUNDS.mergeFollowUpsMs.min}
+            max={INTERACTION_BOUNDS.mergeFollowUpsMs.max}
             value={draft.interaction.mergeFollowUpsMs}
             onChange={(e) => {
-              const next = Math.round(Number(e.target.value))
               setInteraction(
                 'mergeFollowUpsMs',
-                Number.isFinite(next) ? Math.min(5000, Math.max(0, next)) : 2000
+                clampInteractionValue('mergeFollowUpsMs', Number(e.target.value))
               )
             }}
           />
@@ -925,14 +925,13 @@ export default function SettingsView({
           <input
             type="number"
             step="50"
-            min="600"
-            max="1500"
+            min={INTERACTION_BOUNDS.silenceSplitMs.min}
+            max={INTERACTION_BOUNDS.silenceSplitMs.max}
             value={draft.interaction.silenceSplitMs}
             onChange={(e) => {
-              const next = Math.round(Number(e.target.value))
               setInteraction(
                 'silenceSplitMs',
-                Number.isFinite(next) ? Math.min(1500, Math.max(600, next)) : 900
+                clampInteractionValue('silenceSplitMs', Number(e.target.value))
               )
             }}
           />

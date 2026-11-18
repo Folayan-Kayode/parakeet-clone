@@ -1,5 +1,9 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { ChangeEvent, PointerEvent as ReactPointerEvent } from 'react'
+import type {
+  ChangeEvent,
+  KeyboardEvent as ReactKeyboardEvent,
+  PointerEvent as ReactPointerEvent
+} from 'react'
 import type {
   AppConfig,
   CaptureTestCheck,
@@ -10,6 +14,7 @@ import type {
 } from '../../shared/types'
 import {
   parseStructuredAnswerText as parseStructuredAnswer,
+  sanitizeFenceLanguage,
   type StructuredAnswer
 } from '../../shared/structuredAnswer'
 import { buildWhisperPrompt } from '../../shared/whisper-prompt'
@@ -28,6 +33,7 @@ import {
   startSystemStream,
   type Speaker
 } from './lib/audio'
+import { CoalesceController } from './lib/coalesce'
 
 interface Segment {
   id: string
@@ -41,14 +47,6 @@ interface ThemPcmChunk {
   uid: number
   pcm: Uint8Array
   at: number
-}
-
-interface CoalesceHold {
-  question: string
-  anchorUid: number
-  uids: number[]
-  timer: number
-  firing: boolean
 }
 
 interface Answer {
@@ -117,6 +115,8 @@ const QUESTION_TYPE_OPTIONS: ResolvedQuestionType[] = [
   'other'
 ]
 
+const QUESTION_TYPE_MENU: QuestionType[] = ['auto', ...QUESTION_TYPE_OPTIONS]
+
 function structuredAnswerText(card: StructuredAnswer): string {
   const parts: string[] = []
   if (card.approach) parts.push(card.approach)
@@ -124,7 +124,7 @@ function structuredAnswerText(card: StructuredAnswer): string {
     parts.push(card.keySteps.map((step, index) => `${index + 1}. ${step}`).join('\n'))
   }
   if (card.code.source) {
-    parts.push(`\`\`\`${card.code.language}\n${card.code.source}\n\`\`\``)
+    parts.push(`\`\`\`${sanitizeFenceLanguage(card.code.language)}\n${card.code.source}\n\`\`\``)
   }
   const complexity = [
     card.complexity.time && `time ${card.complexity.time}`,
@@ -244,6 +244,9 @@ const AnswerRow = memo(function AnswerRow({ answer, onRegenerate, onStop }: Answ
 
 // In-memory render cap; sessions keep everything retained. Raised for long interviews.
 const MAX_SEGMENTS = 2000
+// Answers can exceed the old 10-row window in long sessions; memoized rows keep
+// rendering cheap and buildSavePayload persists every retained answer.
+const MAX_ANSWERS = 2000
 
 // Session JSON keeps only the most recent screenshots to bound file size.
 const MAX_SESSION_IMAGES = 10
@@ -351,13 +354,54 @@ function uid(): string {
     : Math.random().toString(36).slice(2)
 }
 
+function menuItems(menu: HTMLElement): HTMLButtonElement[] {
+  return Array.from(
+    menu.querySelectorAll<HTMLButtonElement>('[role="menuitem"], [role="menuitemradio"]')
+  )
+}
+
+function focusMenuActiveItem(menu: HTMLElement | null): void {
+  if (!menu) return
+  const items = menuItems(menu)
+  const active = items.find((item) => item.getAttribute('aria-checked') === 'true') ?? items[0]
+  active?.focus()
+}
+
+// Shared chip-menu keyboard behavior: arrows wrap, Escape closes and restores
+// focus to the trigger, and Enter/Space stay native button activation.
+function handleMenuKeyDown(
+  event: ReactKeyboardEvent<HTMLDivElement>,
+  close: () => void,
+  trigger: HTMLButtonElement | null
+): void {
+  if (event.key === 'Escape') {
+    event.preventDefault()
+    close()
+    trigger?.focus()
+    return
+  }
+  if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return
+  event.preventDefault()
+  const items = menuItems(event.currentTarget)
+  if (items.length === 0) return
+  const current = items.indexOf(document.activeElement as HTMLButtonElement)
+  const delta = event.key === 'ArrowDown' ? 1 : -1
+  const next =
+    current < 0
+      ? delta > 0
+        ? 0
+        : items.length - 1
+      : (current + delta + items.length) % items.length
+  items[next]?.focus()
+}
+
 export default function App() {
   const [config, setConfig] = useState<AppConfig | null>(null)
   const [view, setView] = useState<'home' | 'live' | 'settings' | 'history'>('home')
   const [segments, setSegments] = useState<Segment[]>([])
   const [answers, setAnswers] = useState<Answer[]>([])
   const [listening, setListening] = useState(false)
-  const [levels, setLevels] = useState({ you: 0, them: 0 })
+  const [questionMenuOpen, setQuestionMenuOpen] = useState(false)
   const [attachments, setAttachments] = useState<string[]>([])
   const [input, setInput] = useState('')
   const [toast, setToast] = useState<string | null>(null)
@@ -414,6 +458,10 @@ export default function App() {
   const configRef = useRef<AppConfig | null>(null)
   const segmentsRef = useRef<Segment[]>([])
   const answersRef = useRef<Answer[]>([])
+  // Bumped only when a saved session is cleared, NOT on Stop. A Stop→Start
+  // resume is the same interview, so a late whisper result should still append;
+  // results resolving after clearAll (next session) are dropped.
+  const sessionEpochRef = useRef(0)
   const promptRef = useRef<Record<Speaker, string>>({ You: '', Them: '' })
   const titleRef = useRef(title)
   const companyRef = useRef(company)
@@ -440,10 +488,28 @@ export default function App() {
   const atBottomRef = useRef(true)
   const queueTimer = useRef<number | null>(null)
   const themPcm = useRef<ThemPcmChunk[]>([])
-  const coalesceRef = useRef<CoalesceHold | null>(null)
+  const coalesceControllerRef = useRef<CoalesceController | null>(null)
   const regionDrag = useRef<{ startX: number; startY: number; rect: DOMRect } | null>(null)
   const regionImgRef = useRef<HTMLImageElement | null>(null)
   const modelSwitchRef = useRef<HTMLDivElement | null>(null)
+  const questionSwitchRef = useRef<HTMLDivElement | null>(null)
+  const modelTriggerRef = useRef<HTMLButtonElement | null>(null)
+  const modelMenuRef = useRef<HTMLDivElement | null>(null)
+  const questionTriggerRef = useRef<HTMLButtonElement | null>(null)
+  const questionMenuRef = useRef<HTMLDivElement | null>(null)
+  // Direct-DOM meter state: no React state per RMS sample (see handleLevel).
+  const meterBars = useRef<{ you: HTMLDivElement | null; them: HTMLDivElement | null }>({
+    you: null,
+    them: null
+  })
+  const meterPeak = useRef({ you: 0, them: 0 })
+  const meterPeakAt = useRef({ you: 0, them: 0 })
+  const meterDecayFrom = useRef({ you: 0, them: 0 })
+  const meterDecayStart = useRef({ you: 0, them: 0 })
+  const meterRaf = useRef<number | null>(null)
+  const noAudioTimer = useRef<number | null>(null)
+  const themZeroSince = useRef<number | null>(null)
+  const noAudioWarned = useRef(false)
   const toastTimer = useRef<number | null>(null)
 
   configRef.current = config
@@ -456,6 +522,86 @@ export default function App() {
     setToast(message)
     if (toastTimer.current) window.clearTimeout(toastTimer.current)
     toastTimer.current = window.setTimeout(() => setToast(null), 2600)
+  }, [])
+
+  // Peak-hold meter painted directly on the DOM: the audio callback runs ~4x/s
+  // and must not re-render the whole app. rAF stops once both peaks decay.
+  const tickMeters = useCallback(() => {
+    meterRaf.current = null
+    const now = performance.now()
+    let active = false
+    for (const key of ['you', 'them'] as const) {
+      const idle = now - meterPeakAt.current[key]
+      if (idle > 1000) {
+        // Snapshot the held peak once at expiry, then decay from that original
+        // value. Multiplying the already-decayed peak each frame compounded.
+        if (meterDecayStart.current[key] === 0) {
+          meterDecayFrom.current[key] = meterPeak.current[key]
+          meterDecayStart.current[key] = meterPeakAt.current[key] + 1000
+        }
+        meterPeak.current[key] =
+          meterDecayFrom.current[key] *
+          Math.exp(-(now - meterDecayStart.current[key]) / 600)
+        if (meterPeak.current[key] < 0.001) meterPeak.current[key] = 0
+      }
+      const bar = meterBars.current[key]
+      if (bar) bar.style.width = `${Math.min(100, meterPeak.current[key] * 900)}%`
+      if (meterPeak.current[key] > 0.001) active = true
+    }
+    if (active) meterRaf.current = window.requestAnimationFrame(tickMeters)
+  }, [])
+
+  const handleLevel = useCallback(
+    (speaker: Speaker, rms: number) => {
+      const key = speaker === 'You' ? 'you' : 'them'
+      const now = performance.now()
+      if (rms >= meterPeak.current[key]) {
+        meterPeak.current[key] = rms
+        meterPeakAt.current[key] = now
+        meterDecayStart.current[key] = 0
+      }
+      if (meterRaf.current === null) {
+        meterRaf.current = window.requestAnimationFrame(tickMeters)
+      }
+      if (key !== 'them') return
+      // One-time field guide: a silent loopback is the usual capture failure.
+      if (rms < 0.001) {
+        if (themZeroSince.current === null) themZeroSince.current = now
+        else if (!noAudioWarned.current && now - themZeroSince.current >= 20_000) {
+          noAudioWarned.current = true
+          console.log(
+            '[audio] no system audio detected for 20s — check output device / volume mixer'
+          )
+          showToast(
+            'No system audio detected — is the meeting audio playing through your default output device?'
+          )
+        }
+      } else {
+        themZeroSince.current = null
+      }
+    },
+    [showToast, tickMeters]
+  )
+
+  const resetMeters = useCallback(() => {
+    if (meterRaf.current !== null) {
+      window.cancelAnimationFrame(meterRaf.current)
+      meterRaf.current = null
+    }
+    if (noAudioTimer.current !== null) {
+      window.clearTimeout(noAudioTimer.current)
+      noAudioTimer.current = null
+    }
+    meterPeak.current = { you: 0, them: 0 }
+    meterPeakAt.current = { you: 0, them: 0 }
+    meterDecayFrom.current = { you: 0, them: 0 }
+    meterDecayStart.current = { you: 0, them: 0 }
+    themZeroSince.current = null
+    noAudioWarned.current = false
+    for (const key of ['you', 'them'] as const) {
+      const bar = meterBars.current[key]
+      if (bar) bar.style.width = '0%'
+    }
   }, [])
 
   const loadHistory = useCallback(async () => {
@@ -548,15 +694,18 @@ export default function App() {
     return off
   }, [])
 
-  // Dismiss the profile menu on an outside pointerdown or Escape.
+  // Dismiss whichever chip menu is open on an outside pointerdown or Escape.
   useEffect(() => {
-    if (!modelMenuOpen) return
+    if (!modelMenuOpen && !questionMenuOpen) return
     const onPointerDown = (event: PointerEvent): void => {
-      if (modelSwitchRef.current?.contains(event.target as Node)) return
-      setModelMenuOpen(false)
+      const target = event.target as Node
+      if (!modelSwitchRef.current?.contains(target)) setModelMenuOpen(false)
+      if (!questionSwitchRef.current?.contains(target)) setQuestionMenuOpen(false)
     }
     const onKeyDown = (event: KeyboardEvent): void => {
-      if (event.key === 'Escape') setModelMenuOpen(false)
+      if (event.key !== 'Escape') return
+      setModelMenuOpen(false)
+      setQuestionMenuOpen(false)
     }
     document.addEventListener('pointerdown', onPointerDown)
     document.addEventListener('keydown', onKeyDown)
@@ -564,7 +713,16 @@ export default function App() {
       document.removeEventListener('pointerdown', onPointerDown)
       document.removeEventListener('keydown', onKeyDown)
     }
+  }, [modelMenuOpen, questionMenuOpen])
+
+  // Opening a chip menu moves focus to its selected item for keyboard use.
+  useEffect(() => {
+    if (modelMenuOpen) focusMenuActiveItem(modelMenuRef.current)
   }, [modelMenuOpen])
+
+  useEffect(() => {
+    if (questionMenuOpen) focusMenuActiveItem(questionMenuRef.current)
+  }, [questionMenuOpen])
 
   // Sticky-bottom: follow new content only while the reader is already at the
   // bottom; scrolling up pauses following until they return to the bottom.
@@ -619,10 +777,9 @@ export default function App() {
       engines.current?.them?.stop()
       void window.api.setCaptureListening(false).catch(() => undefined)
       if (queueTimer.current) window.clearTimeout(queueTimer.current)
-      if (coalesceRef.current) {
-        window.clearTimeout(coalesceRef.current.timer)
-        coalesceRef.current = null
-      }
+      if (meterRaf.current !== null) window.cancelAnimationFrame(meterRaf.current)
+      if (noAudioTimer.current !== null) window.clearTimeout(noAudioTimer.current)
+      coalesceControllerRef.current?.dispose()
     }
   }, [])
 
@@ -714,100 +871,40 @@ export default function App() {
     [whisperPrompt]
   )
 
-  const fireCoalesce = useCallback(async (): Promise<void> => {
-    const hold = coalesceRef.current
-    if (!hold) return
-    // Take ownership: kill any restarted timer, then freeze timer restarts while
-    // the re-transcription is in flight.
-    window.clearTimeout(hold.timer)
-    hold.firing = true
-    const uidCount = hold.uids.length
-    let question = hold.question
-    if (uidCount >= 2) {
-      const audioText = await transcribeCoalesced(hold.uids)
-      if (coalesceRef.current !== hold) return
-      if (hold.uids.length !== uidCount) {
-        // A continuation landed mid-transcription. Keep the hold and re-run the
-        // timer so the extended set is re-transcribed with all of its audio.
-        hold.firing = false
-        const mergeMs = configRef.current?.interaction.mergeFollowUpsMs ?? 2000
-        window.clearTimeout(hold.timer)
-        hold.timer = window.setTimeout(
-          () => void fireCoalesce(),
-          Math.max(600, Math.round(mergeMs * 0.6))
-        )
-        return
-      }
-      question = audioText ?? hold.question
-    }
-    if (coalesceRef.current !== hold) return
-    coalesceRef.current = null
-    const cfg = configRef.current
-    if (!cfg || !cfg.interaction.autoAnswer) return
-    const cooldownLeft = cfg.interaction.answerCooldownMs - (Date.now() - lastAnswerAt.current)
-    if (streaming.current || cooldownLeft > 0) {
-      queueAsk(question, hold.anchorUid)
-    } else {
-      askRef.current(question, hold.anchorUid)
-    }
-  }, [queueAsk, transcribeCoalesced])
+  // The coalescing state machine lives in lib/coalesce. Dependencies read refs
+  // so the controller is created once and survives config/state re-renders.
+  const transcribeRef = useRef<(uids: number[]) => Promise<string | null>>(async () => null)
+  transcribeRef.current = transcribeCoalesced
+  const queueAskRef = useRef<(question: string, anchorUid: number) => void>(() => undefined)
+  queueAskRef.current = queueAsk
+  const coalesce =
+    coalesceControllerRef.current ??
+    new CoalesceController({
+      mergeMs: () => configRef.current?.interaction.mergeFollowUpsMs ?? 2000,
+      onAsk: (question, anchorUid) => askRef.current(question, anchorUid),
+      onQueue: (question, anchorUid) => queueAskRef.current(question, anchorUid),
+      isStreaming: () => streaming.current,
+      isAutoAnswer: () => configRef.current?.interaction.autoAnswer === true,
+      isListening: () => listeningRef.current,
+      cooldownMs: () => configRef.current?.interaction.answerCooldownMs ?? 5000,
+      lastAnswerAt: () => lastAnswerAt.current,
+      timers: {
+        set: (fn, ms) => window.setTimeout(fn, ms),
+        clear: (id) => window.clearTimeout(id)
+      },
+      transcribe: (uids) => transcribeRef.current(uids)
+    })
+  coalesceControllerRef.current = coalesce
 
-  const restartCoalesceTimer = useCallback(
-    (delayMs: number) => {
-      const hold = coalesceRef.current
-      if (!hold) return
-      window.clearTimeout(hold.timer)
-      hold.timer = window.setTimeout(() => void fireCoalesce(), delayMs)
-    },
-    [fireCoalesce]
-  )
+  const cancelCoalesce = useCallback(() => coalesce.cancel(), [coalesce])
 
-  const startCoalesce = useCallback(
-    (question: string, anchorUid: number, mergeMs: number) => {
-      const timer = window.setTimeout(() => void fireCoalesce(), mergeMs)
-      coalesceRef.current = { question, anchorUid, uids: [anchorUid], timer, firing: false }
-    },
-    [fireCoalesce]
-  )
-
-  const addCoalesceContinuation = useCallback(
-    (uid: number, text: string, mergeMs: number) => {
-      const hold = coalesceRef.current
-      if (!hold) return
-      if (!hold.uids.includes(uid)) hold.uids.push(uid)
-      hold.question = `${hold.question} ${text}`.trim()
-      // While a re-transcription is in flight, the fire path re-checks the uid
-      // count and restarts the timer itself.
-      if (!hold.firing) restartCoalesceTimer(Math.max(600, Math.round(mergeMs * 0.6)))
-    },
-    [restartCoalesceTimer]
-  )
-
-  const extendCoalesce = useCallback(() => {
-    // A partial means the final chunk is still coming; restart at the 600 ms
-    // minimum so a long hold cannot be pushed forward indefinitely.
-    const hold = coalesceRef.current
-    if (!hold || hold.firing) return
-    restartCoalesceTimer(600)
-  }, [restartCoalesceTimer])
-
-  const cancelCoalesce = useCallback(() => {
-    const hold = coalesceRef.current
-    if (!hold) return
-    window.clearTimeout(hold.timer)
-    coalesceRef.current = null
-  }, [])
-
+  // Manual Answer during a grace hold: prefer the merged audio text. The hold
+  // is taken synchronously inside the controller, so a concurrent fire cannot
+  // ask the same question twice.
   const takeCoalesceForManualAsk = useCallback(async (): Promise<string | null> => {
-    const hold = coalesceRef.current
-    if (!hold) return null
-    cancelCoalesce()
-    if (hold.uids.length >= 2) {
-      const audioText = await transcribeCoalesced(hold.uids)
-      if (audioText) return audioText
-    }
-    return hold.question
-  }, [cancelCoalesce, transcribeCoalesced])
+    const consumed = await coalesce.consumeManual()
+    return consumed?.question ?? null
+  }, [coalesce])
 
   const appendSegment = useCallback(
     (speaker: Speaker, text: string, partialId?: string, utteranceId = -1) => {
@@ -856,14 +953,20 @@ export default function App() {
       const cfg = configRef.current
       // A pending hold treats any new Them final as a continuation, even when
       // the fragment alone does not look like a complete question.
-      if (speaker === 'Them' && coalesceRef.current && cfg?.interaction.autoAnswer) {
+      if (
+        speaker === 'Them' &&
+        coalesce.hasPending() &&
+        cfg?.interaction.autoAnswer &&
+        listeningRef.current
+      ) {
         if (!askedUids.current.has(utteranceId)) askedUids.current.add(utteranceId)
-        addCoalesceContinuation(utteranceId, clean, cfg.interaction.mergeFollowUpsMs)
+        coalesce.addContinuation(utteranceId, clean)
         return
       }
       if (
         speaker === 'Them' &&
         cfg?.interaction.autoAnswer &&
+        listeningRef.current &&
         isQuestion(clean) &&
         !askedUids.current.has(utteranceId)
       ) {
@@ -873,24 +976,13 @@ export default function App() {
         const wordCount = clean.trim().split(/\s+/).filter(Boolean).length
         if (wordCount < 4) return
         askedUids.current.add(utteranceId)
-        const mergeMs = cfg.interaction.mergeFollowUpsMs
         // Coalescing applies to final-triggered auto-answers only; early-trigger
-        // asks keep their immediate behavior (explicit opt-in for speed).
-        if (mergeMs > 0) {
-          startCoalesce(clean, utteranceId, mergeMs)
-          return
-        }
-        if (
-          !streaming.current &&
-          Date.now() - lastAnswerAt.current >= cfg.interaction.answerCooldownMs
-        ) {
-          askRef.current(clean, utteranceId)
-        } else {
-          queueAsk(clean, utteranceId)
-        }
+        // asks keep their immediate behavior (explicit opt-in for speed). A zero
+        // grace window takes the controller's immediate ask/queue branch.
+        coalesce.hold(clean, utteranceId)
       }
     },
-    [addCoalesceContinuation, queueAsk, startCoalesce]
+    [coalesce]
   )
 
   const handlePartial = useCallback(
@@ -898,6 +990,7 @@ export default function App() {
       if (!configRef.current?.interaction.streamingPartials) return
       if (partialBusy.current[speaker]) return
       partialBusy.current[speaker] = true
+      const epoch = sessionEpochRef.current
       const seq = ++partialSeq.current[speaker]
       const info = partialInfo.current[speaker]
       info.uid = uid
@@ -905,6 +998,7 @@ export default function App() {
       window.api
         .transcribe(wav, whisperPrompt(speaker))
         .then(({ text }) => {
+          if (epoch !== sessionEpochRef.current) return
           const clean = text.trim()
           const cur = partialInfo.current[speaker]
           if (!clean || cur.uid !== uid || cur.finalizing || seq <= cur.applied) return
@@ -927,16 +1021,17 @@ export default function App() {
             return next
           })
           const cfg = configRef.current
-          if (speaker === 'Them' && coalesceRef.current) {
+          if (speaker === 'Them' && coalesce.hasPending()) {
             // More speech is still arriving for the held question; the final
             // chunk will extend the hold, so do not early-ask here.
-            extendCoalesce()
+            coalesce.extend()
             return
           }
           if (
             speaker === 'Them' &&
             cfg?.interaction.autoAnswer &&
             cfg.interaction.earlyAnswer &&
+            listeningRef.current &&
             !askedUids.current.has(uid) &&
             looksCompleteQuestion(clean)
           ) {
@@ -957,7 +1052,7 @@ export default function App() {
           partialBusy.current[speaker] = false
         })
     },
-    [extendCoalesce, queueAsk, whisperPrompt]
+    [coalesce, queueAsk, whisperPrompt]
   )
 
   const onWav = useCallback(
@@ -967,9 +1062,12 @@ export default function App() {
       info.uid = uid
       info.finalizing = true
       if (speaker === 'Them') rememberThemPcm(uid, wav)
+      const epoch = sessionEpochRef.current
       chains.current[speaker] = chains.current[speaker]
         .then(async () => {
           const { text } = await window.api.transcribe(wav, whisperPrompt(speaker))
+          // End/Stop may have drained and moved on while whisper was working.
+          if (epoch !== sessionEpochRef.current) return
           asrFailures.current[speaker] = 0
           asrWarningDismissed.current = false
           setAsrWarning(false)
@@ -1003,12 +1101,15 @@ export default function App() {
       useAttachments?: boolean
       anchorUid?: number
       answerAnchor?: string
+      /** Regenerate a structured card without resending the original image. */
+      keepStructured?: boolean
     }) => {
       const cfg = configRef.current
       if (!cfg || streaming.current) return
       // Claim the lock before resolving a pending coalesce so a second rapid
       // Answer press cannot start a parallel ask during the re-transcription.
       streaming.current = true
+      const keepStructured = opts?.keepStructured === true
       let question = opts?.question?.trim()
       if (!question && !opts?.answerAnchor && !opts?.answerId) {
         // Manual Answer/hotkey during a grace hold: prefer the merged question.
@@ -1040,27 +1141,43 @@ export default function App() {
           : [...segmentsRef.current].reverse().find((s) => s.speaker === 'Them')?.id ?? undefined)
       // Auto resolves from the explicit question, else the latest remote turn.
       const latestThem = [...segmentsRef.current].reverse().find((s) => s.speaker === 'Them')
-      const questionType = resolveQuestionType(
-        cfg.answer.questionType,
-        question ?? latestThem?.text ?? transcript
-      )
+      const questionType: ResolvedQuestionType = keepStructured
+        ? 'coding'
+        : resolveQuestionType(
+            cfg.answer.questionType,
+            question ?? latestThem?.text ?? transcript
+          )
       // Outgoing images for this ask: none for regenerate, and none over IPC
       // when vision is off (main would drop them anyway). The model only sees
       // images when vision is enabled.
       const images =
         opts?.useAttachments === false || !cfg.llm.vision ? [] : attachments
       const hasImageAttachment = images.length > 0
-      const structured = hasImageAttachment && questionType === 'coding'
+      const structured =
+        (hasImageAttachment && questionType === 'coding') || keepStructured
       const assistantTurns: ChatMessage[] = answersRef.current
         .filter((a) => a.text.trim() && !a.error)
         .slice(-2)
         .map((a) => ({ role: 'assistant', content: a.text }))
       console.log(`[answer-anchor] ${anchorId ?? 'none'} | ${questionType} | ${question ?? ''}`)
       if (structured) structuredAnswers.current.add(id)
-      setAnswers((prev) => [
-        ...prev.filter((a) => a.id !== id).slice(-9),
-        { id, text: '', streaming: true, question, transcript, anchorId, images }
-      ])
+      setAnswers((prev) => {
+        const next: Answer[] = [
+          ...prev.filter((a) => a.id !== id).slice(-MAX_ANSWERS),
+          { id, text: '', streaming: true, question, transcript, anchorId, images }
+        ]
+        // Only the newest MAX_SESSION_IMAGES-bearing answers can be persisted.
+        // Older answers would otherwise pin their full data-URL arrays (up to 9
+        // JPEGs each) for the whole 2000-row window — hundreds of MB of dead
+        // strings. Blank whole arrays (not partial) once the count is exceeded.
+        let withImages = 0
+        for (let i = next.length - 1; i >= 0; i--) {
+          if (!next[i].images || next[i].images!.length === 0) continue
+          withImages += 1
+          if (withImages > MAX_SESSION_IMAGES) next[i] = { ...next[i], images: [] }
+        }
+        return next
+      })
       const userContent = [
         `Session: ${titleRef.current}`,
         '',
@@ -1070,7 +1187,7 @@ export default function App() {
         question ? `User question: ${question}` : 'Answer the latest question from the transcript.'
       ].join('\n')
       const messages: ChatMessage[] = [
-        { role: 'system', content: buildSystemPrompt(cfg, hasImageAttachment, questionType) },
+        { role: 'system', content: buildSystemPrompt(cfg, hasImageAttachment, questionType, keepStructured) },
         ...assistantTurns,
         { role: 'user', content: userContent }
       ]
@@ -1116,7 +1233,8 @@ export default function App() {
         question: answer.question,
         transcript: answer.transcript,
         useAttachments: false,
-        answerAnchor: answer.anchorId
+        answerAnchor: answer.anchorId,
+        keepStructured: Boolean(answer.card)
       })
     },
     [ask]
@@ -1271,6 +1389,9 @@ export default function App() {
   }, [closeRegionPicker, showToast])
 
   const clearAll = useCallback(() => {
+    // Session boundary: any transcription still in flight belongs to the old
+    // session and must not contaminate the next one.
+    sessionEpochRef.current += 1
     setSegments([])
     segmentsRef.current = []
     setAnswers([])
@@ -1278,6 +1399,7 @@ export default function App() {
     transcriptSavedRef.current = false
     cancelCoalesce()
     themPcm.current = []
+    resetMeters()
     partialInfo.current = {
       You: { uid: -1, applied: 0, finalizing: false },
       Them: { uid: -1, applied: 0, finalizing: false }
@@ -1287,10 +1409,11 @@ export default function App() {
     askedUids.current = new Set()
     pendingAsks.current = []
     promptRef.current = { You: '', Them: '' }
-  }, [cancelCoalesce])
+  }, [cancelCoalesce, resetMeters])
 
   const startCapture = useCallback(async () => {
     setError(null)
+    resetMeters()
     try {
       const wantMic = configRef.current?.interaction.transcribeMic ?? false
       const silenceMs = configRef.current?.interaction.silenceSplitMs ?? 900
@@ -1300,47 +1423,76 @@ export default function App() {
       const results = await Promise.allSettled([micPromise, startSystemStream()])
       const mic = results[0].status === 'fulfilled' ? results[0].value : null
       const system = results[1].status === 'fulfilled' ? results[1].value : null
+      const systemError =
+        results[1].status === 'rejected' ? errorMessage(results[1].reason) : null
       console.log('[capture] sources', {
         mic: Boolean(mic),
         system: Boolean(system),
         systemTracks: system?.getAudioTracks().length ?? 0,
         micError: results[0].status === 'rejected' ? String(results[0].reason) : null,
-        systemError: results[1].status === 'rejected' ? String(results[1].reason) : null
+        systemError
       })
       if (system) {
         const track = system.getAudioTracks()[0]
-        track?.addEventListener('ended', () => console.log('[capture] system track ended'))
+        const settings = track?.getSettings()
+        console.log('[capture] system audio', {
+          present: Boolean(track),
+          tracks: system.getAudioTracks().length,
+          label: track?.label || '(none)',
+          sampleRate: settings?.sampleRate ?? null,
+          channelCount: settings?.channelCount ?? null
+        })
+        track?.addEventListener('ended', () => {
+          if (noAudioTimer.current !== null) {
+            window.clearTimeout(noAudioTimer.current)
+            noAudioTimer.current = null
+          }
+          const stats = engines.current?.them?.getStats()
+          console.log('[capture] system track ended', stats ?? null)
+          showToast('System audio capture ended')
+        })
         track?.addEventListener('mute', () => console.log('[capture] system track muted'))
         track?.addEventListener('unmute', () => console.log('[capture] system track unmuted'))
       }
       if (!mic && !system) {
         throw new Error(
-          'No audio sources available. Check your microphone and Windows output device.'
+          systemError
+            ? `No audio sources available — ${systemError}`
+            : 'No audio sources available. Check your microphone and Windows output device.'
         )
       }
       const you = mic
-        ? new AudioEngine(
-            'You',
-            onWav,
-            (level) => setLevels((prev) => ({ ...prev, you: level })),
-            handlePartial,
-            silenceMs
-          )
+        ? new AudioEngine('You', onWav, handleLevel, handlePartial, silenceMs, showToast)
         : undefined
       const them = system
-        ? new AudioEngine(
-            'Them',
-            onWav,
-            (level) => setLevels((prev) => ({ ...prev, them: level })),
-            handlePartial,
-            silenceMs
-          )
+        ? new AudioEngine('Them', onWav, handleLevel, handlePartial, silenceMs, showToast)
         : undefined
-      if (you && mic) await you.startWithStream(mic)
-      if (them && system) await them.startWithStream(system)
+      try {
+        if (you && mic) await you.startWithStream(mic)
+        if (them && system) await them.startWithStream(system)
+      } catch (err) {
+        you?.stop()
+        them?.stop()
+        throw err
+      }
       engines.current?.you?.stop()
       engines.current?.them?.stop()
       engines.current = { you, them }
+      if (them) {
+        // Complements the RMS watchdog: fires only when the engine produced no
+        // level callbacks at all in the first 20 s (silent/broken loopback).
+        noAudioTimer.current = window.setTimeout(() => {
+          noAudioTimer.current = null
+          if (noAudioWarned.current || meterPeakAt.current.them > 0) return
+          noAudioWarned.current = true
+          console.log(
+            '[audio] no system audio callbacks for 20s — check output device / volume mixer'
+          )
+          showToast(
+            'No system audio detected — is the meeting audio playing through your default output device?'
+          )
+        }, 20_000)
+      }
       cancelCoalesce()
       themPcm.current = []
       askedUids.current = new Set()
@@ -1351,13 +1503,19 @@ export default function App() {
       void window.api.setCaptureListening(true).catch(() => undefined)
       setView('live')
       if (wantMic && !mic) setError('Microphone unavailable — capturing system audio only.')
-      if (!system) setError('System audio unavailable — check your Windows output device.')
+      if (!system) {
+        setError(
+          systemError
+            ? `System audio unavailable — ${systemError}`
+            : 'System audio unavailable — check your Windows output device.'
+        )
+      }
     } catch (err) {
       setError(errorMessage(err))
       setListening(false)
       void window.api.setCaptureListening(false).catch(() => undefined)
     }
-  }, [onWav, cancelCoalesce])
+  }, [onWav, cancelCoalesce, handleLevel, resetMeters, showToast])
 
   const beginSession = useCallback(async () => {
     // A fresh session never inherits the previous transcript; resuming from the
@@ -1463,11 +1621,14 @@ export default function App() {
   }, [startCapture])
 
   const stopCapture = useCallback(() => {
+    const themStats = engines.current?.them?.getStats()
+    if (themStats) console.log('[capture] stop', themStats)
     engines.current?.you?.stop()
     engines.current?.them?.stop()
     engines.current = null
     cancelCoalesce()
     themPcm.current = []
+    resetMeters()
     askedUids.current = new Set()
     pendingAsks.current = []
     if (queueTimer.current) {
@@ -1476,17 +1637,21 @@ export default function App() {
     }
     setListening(false)
     void window.api.setCaptureListening(false).catch(() => undefined)
-    setLevels({ you: 0, them: 0 })
-  }, [cancelCoalesce])
+  }, [cancelCoalesce, resetMeters])
 
   // Snapshot shared by the real save and the 120s autosave. Orphan anchors get
   // a placeholder so history keeps the Q→A pairing.
   const buildSavePayload = useCallback((endedAt: string) => {
     const sessionSegments = [...segmentsRef.current]
     const currentAnswers = answersRef.current
+    // Build the id index once instead of rescanning the growing segment array
+    // for every answer; placeholders are added to the set so duplicate orphan
+    // anchors still produce one placeholder.
+    const segmentIds = new Set(sessionSegments.map((s) => s.id))
     for (const answer of currentAnswers) {
       const anchorId = answer.anchorId
-      if (anchorId && !sessionSegments.some((s) => s.id === anchorId)) {
+      if (anchorId && !segmentIds.has(anchorId)) {
+        segmentIds.add(anchorId)
         sessionSegments.push({
           id: anchorId,
           speaker: 'Them',
@@ -1519,6 +1684,7 @@ export default function App() {
         error: a.error,
         question: a.question,
         anchorId: a.anchorId,
+        card: a.card,
         images: imagesByAnswer[index]
       }))
     }
@@ -1554,6 +1720,7 @@ export default function App() {
       try {
         stopCapture()
         await drainChains()
+        let saveFailed = false
         if (
           !transcriptSavedRef.current &&
           (segmentsRef.current.length > 0 || answersRef.current.length > 0)
@@ -1566,10 +1733,15 @@ export default function App() {
               // Start the next session empty; otherwise Settings → Back could
               // re-save this transcript into a new session file.
               clearAll()
+            } else {
+              saveFailed = true
+              setError('Session save failed')
+              showToast('Session save failed')
             }
             void loadHistory()
           } catch (err) {
             // session:save now rejects on a write failure; keep it visible.
+            saveFailed = true
             const message = errorMessage(err).replace(
               /^Error invoking remote method '[^']+': (?:Error: )?/,
               ''
@@ -1578,7 +1750,12 @@ export default function App() {
             showToast(message)
           }
         }
-        setView('home')
+        // A failed save must not strand the transcript on Home (Start wipes it):
+        // stay on the live view so End can retry. Quit still proceeds below via
+        // main's autosave fallback, so the user is never trapped. No clearAll
+        // ran, so the epoch is unchanged: a delayed drain result may append to
+        // this stopped session, but listening=false blocks any auto-ask.
+        if (!saveFailed) setView('home')
         if (thenQuit || endQuitPendingRef.current) {
           try {
             await window.api.quitAfterSave()
@@ -1677,14 +1854,6 @@ export default function App() {
     cancelCoalesce()
     void ask({ question })
   }, [ask, input, cancelCoalesce])
-
-  const levelStyle = useMemo(
-    () => ({
-      you: { width: `${Math.min(100, levels.you * 900)}%` },
-      them: { width: `${Math.min(100, levels.them * 900)}%` }
-    }),
-    [levels]
-  )
 
   // Chat-style thread: each answer renders directly beneath its question segment.
   const thread = useMemo(() => {
@@ -2116,8 +2285,11 @@ export default function App() {
             <div className="live-head">
               <div className="model-switch" ref={modelSwitchRef}>
                 <button
+                  ref={modelTriggerRef}
                   className="model-chip"
                   title="Applies to your next question"
+                  aria-haspopup="menu"
+                  aria-expanded={modelMenuOpen}
                   onClick={() => setModelMenuOpen((open) => !open)}
                 >
                   <span className={`badge ${activeProfile.badge}`}>
@@ -2127,7 +2299,14 @@ export default function App() {
                   <span className="model-chip-caret">▾</span>
                 </button>
                 {modelMenuOpen && (
-                  <div className="model-menu" role="menu">
+                  <div
+                    className="model-menu"
+                    role="menu"
+                    ref={modelMenuRef}
+                    onKeyDown={(e) =>
+                      handleMenuKeyDown(e, () => setModelMenuOpen(false), modelTriggerRef.current)
+                    }
+                  >
                     {config.llm.profiles.map((profile) => {
                       const selected = profile.id === config.llm.activeProfileId
                       return (
@@ -2150,20 +2329,32 @@ export default function App() {
                 )}
               </div>
             </div>
-            <div className="meters">
-              <div className="meter">
-                <span className="meter-label">You</span>
-                <div className="meter-track">
-                  <div className="meter-fill you" style={levelStyle.you} />
+            {listening && (
+              <div className="meters">
+                <div className="meter">
+                  <span className="meter-label">You</span>
+                  <div className="meter-track">
+                    <div
+                      className="meter-fill you"
+                      ref={(el) => {
+                        meterBars.current.you = el
+                      }}
+                    />
+                  </div>
+                </div>
+                <div className="meter">
+                  <span className="meter-label meter-label-them">Them ◂▮▮▸</span>
+                  <div className="meter-track">
+                    <div
+                      className="meter-fill them"
+                      ref={(el) => {
+                        meterBars.current.them = el
+                      }}
+                    />
+                  </div>
                 </div>
               </div>
-              <div className="meter">
-                <span className="meter-label">Them</span>
-                <div className="meter-track">
-                  <div className="meter-fill them" style={levelStyle.them} />
-                </div>
-              </div>
-            </div>
+            )}
 
             <div
               className="scroll"
@@ -2222,21 +2413,60 @@ export default function App() {
                 }}
               />
               <div className="composer-actions">
-                <select
-                  className="type-select"
-                  title="Question type — Auto guesses from the question and affects effort, STAR and coding format"
-                  value={config.answer.questionType}
-                  onChange={(e) => updateQuestionType(e.target.value as QuestionType)}
-                >
-                  <option value="auto">
-                    Auto · {QUESTION_TYPE_LABELS[resolvedQuestionType]}
-                  </option>
-                  {QUESTION_TYPE_OPTIONS.map((type) => (
-                    <option key={type} value={type}>
-                      {QUESTION_TYPE_LABELS[type]}
-                    </option>
-                  ))}
-                </select>
+                <div className="model-switch question-switch" ref={questionSwitchRef}>
+                  <button
+                    ref={questionTriggerRef}
+                    className="model-chip question-chip"
+                    title="Question type — Auto guesses from the question and affects effort, STAR and coding format"
+                    aria-haspopup="menu"
+                    aria-expanded={questionMenuOpen}
+                    onClick={() => setQuestionMenuOpen((open) => !open)}
+                  >
+                    <span className="model-chip-label">
+                      {config.answer.questionType === 'auto'
+                        ? `Auto · ${QUESTION_TYPE_LABELS[resolvedQuestionType]}`
+                        : QUESTION_TYPE_LABELS[config.answer.questionType]}
+                    </span>
+                    <span className="model-chip-caret">▾</span>
+                  </button>
+                  {questionMenuOpen && (
+                    <div
+                      className="model-menu question-menu"
+                      role="menu"
+                      ref={questionMenuRef}
+                      onKeyDown={(e) =>
+                        handleMenuKeyDown(
+                          e,
+                          () => setQuestionMenuOpen(false),
+                          questionTriggerRef.current
+                        )
+                      }
+                    >
+                      {QUESTION_TYPE_MENU.map((type) => {
+                        const selected = config.answer.questionType === type
+                        return (
+                          <button
+                            key={type}
+                            role="menuitemradio"
+                            aria-checked={selected}
+                            className={`model-menu-item${selected ? ' active' : ''}`}
+                            onClick={() => {
+                              setQuestionMenuOpen(false)
+                              updateQuestionType(type)
+                            }}
+                          >
+                            <span className="model-menu-label">
+                              {type === 'auto'
+                                ? `Auto · ${QUESTION_TYPE_LABELS[resolvedQuestionType]}`
+                                : QUESTION_TYPE_LABELS[type]}
+                            </span>
+                            <span className="model-menu-check">{selected ? '✓' : ''}</span>
+                          </button>
+                        )
+                      })}
+                    </div>
+                  )}
+                </div>
                 <button className="btn" onClick={() => void captureShot()} title="Ctrl+Alt+Enter">
                   Screenshot
                 </button>

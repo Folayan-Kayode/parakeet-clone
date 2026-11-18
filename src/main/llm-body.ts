@@ -6,6 +6,12 @@ import type {
   ModelProfile,
   WindowConfig
 } from '../shared/types'
+import {
+  INTERACTION_BOUNDS,
+  clampInteractionValue,
+  clampMaxTokensValue,
+  clampTemperatureValue
+} from '../shared/clamps'
 
 // Pure model-profile / request-body layer extracted from main/index.ts.
 // No Electron imports: the callers pass the config default as a parameter where
@@ -16,11 +22,11 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
 }
 
 export function clampTemperature(value: number): number {
-  return Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : 0.2
+  return clampTemperatureValue(value)
 }
 
 export function clampMaxTokens(value: number): number {
-  return Number.isFinite(value) ? Math.min(8192, Math.max(128, Math.round(value))) : 4096
+  return clampMaxTokensValue(value)
 }
 
 // Never send 'minimal' (errors on current Flash models) or 'none' (unsupported on Gemini 3.x/4.x).
@@ -30,15 +36,19 @@ export function clampReasoningEffort(
   return value === 'medium' || value === 'high' ? value : 'low'
 }
 
-export const ANSWER_COOLDOWN_MIN_MS = 1000
-export const ANSWER_COOLDOWN_MAX_MS = 30_000
-export const ANSWER_COOLDOWN_DEFAULT_MS = 5000
-
 // A hand-edited/out-of-range cooldown would hammer the LLM endpoint (or stall
-// auto-answer); the settings input uses the same 1000–30000 bounds.
+// auto-answer); the settings input reads the same INTERACTION_BOUNDS entry.
 export function clampAnswerCooldown(value: unknown): number {
-  if (typeof value !== 'number' || !Number.isFinite(value)) return ANSWER_COOLDOWN_DEFAULT_MS
-  return Math.min(ANSWER_COOLDOWN_MAX_MS, Math.max(ANSWER_COOLDOWN_MIN_MS, Math.round(value)))
+  if (typeof value !== 'number') return INTERACTION_BOUNDS.answerCooldownMs.fallback
+  return clampInteractionValue('answerCooldownMs', value)
+}
+
+// Anti-deadlock backstop — generous enough that only a hung endpoint trips it;
+// multi-image + deep-thinking asks legitimately take 20–60s+ to first byte.
+// 60s base + 5s per attached image, capped at 120s.
+export function computeResponseDeadlineMs(imageCount: number): number {
+  const images = Number.isFinite(imageCount) ? Math.max(0, Math.floor(imageCount)) : 0
+  return Math.min(120_000, 60_000 + images * 5_000)
 }
 
 // Hand-edited window bounds may be strings or garbage; setBounds() throws on a
@@ -261,4 +271,25 @@ export function buildChatMessages({
       : question
   messages.push({ role: 'user', content })
   return messages
+}
+
+// The renderer sends [system, ...assistant turns, user]. The first message is
+// treated as the system prompt even if it is not role=system, and the last is
+// the question. An empty request has no question; the blank user message is a
+// placeholder the caller omits (the chat handler guards on messages.length so
+// the wire request keeps the old no-user-turn behavior).
+export function decomposeMessages(messages: ChatMessage[]): {
+  systemPrompt: string
+  priorTurns: ChatMessage[]
+  question: ChatMessage
+} {
+  const question: ChatMessage = messages[messages.length - 1] ?? {
+    role: 'user',
+    content: ''
+  }
+  return {
+    systemPrompt: messages[0]?.content ?? '',
+    priorTurns: messages.slice(1, messages.length - 1),
+    question
+  }
 }

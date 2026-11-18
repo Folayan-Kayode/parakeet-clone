@@ -15,7 +15,9 @@ import {
   clampMaxTokens,
   clampReasoningEffort,
   clampTemperature,
+  computeResponseDeadlineMs,
   coerceWindowBounds,
+  decomposeMessages,
   effectiveEffort,
   legacyProfile,
   normalizeAnswer,
@@ -481,6 +483,16 @@ describe('clampAnswerCooldown', () => {
   })
 })
 
+describe('computeResponseDeadlineMs', () => {
+  it('scales 60s base by 5s per image, capped at 120s', () => {
+    expect(computeResponseDeadlineMs(0)).toBe(60_000)
+    expect(computeResponseDeadlineMs(1)).toBe(65_000)
+    expect(computeResponseDeadlineMs(6)).toBe(90_000)
+    expect(computeResponseDeadlineMs(12)).toBe(120_000)
+    expect(computeResponseDeadlineMs(20)).toBe(120_000)
+  })
+})
+
 describe('activeProfile', () => {
   it('resolves the active id, then falls back to the first profile, then legacy', () => {
     const a = profile({ id: 'a' })
@@ -568,5 +580,62 @@ describe('buildChatMessages', () => {
     expect(buildChatMessages({ systemPrompt, images: [], vision: true })).toEqual([
       { role: 'system', content: systemPrompt }
     ])
+  })
+})
+
+describe('decomposeMessages', () => {
+  const system: ChatMessage = { role: 'system', content: 'You are the copilot.' }
+  const first: ChatMessage = { role: 'assistant', content: 'first' }
+  const second: ChatMessage = { role: 'assistant', content: 'second' }
+  const user: ChatMessage = { role: 'user', content: 'Tell me about a hard bug.' }
+
+  it('splits [system, ...assistants, user] into prompt, prior turns and question', () => {
+    expect(decomposeMessages([system, first, second, user])).toEqual({
+      systemPrompt: system.content,
+      priorTurns: [first, second],
+      question: user
+    })
+  })
+
+  it('uses the first message as the system prompt even when it is not role=system', () => {
+    expect(decomposeMessages([first, user])).toEqual({
+      systemPrompt: first.content,
+      priorTurns: [],
+      question: user
+    })
+  })
+
+  it('returns a blank system, no prior turns and a blank user placeholder for an empty array', () => {
+    // The chat handler guards on messages.length, so this placeholder never
+    // becomes a wire-level user turn (matching the old last?.content behavior).
+    expect(decomposeMessages([])).toEqual({
+      systemPrompt: '',
+      priorTurns: [],
+      question: { role: 'user', content: '' }
+    })
+  })
+
+  it('uses a single user message as both the system prompt and the question', () => {
+    expect(decomposeMessages([user])).toEqual({
+      systemPrompt: user.content,
+      priorTurns: [],
+      question: user
+    })
+  })
+
+  it('uses a lone system message as the question because it is the last message', () => {
+    expect(decomposeMessages([system])).toEqual({
+      systemPrompt: system.content,
+      priorTurns: [],
+      question: system
+    })
+  })
+
+  it('has no prior turns for a system+user request', () => {
+    expect(decomposeMessages([system, user])).toEqual({
+      systemPrompt: system.content,
+      priorTurns: [],
+      question: user
+    })
   })
 })

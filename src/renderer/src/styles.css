@@ -551,7 +551,13 @@ body {
 .meter-label {
   font-size: 10.5px;
   color: #8b8b95;
-  width: 40px;
+  width: auto;
+  min-width: 40px;
+  flex-shrink: 0;
+}
+
+.meter-label-them {
+  min-width: 78px;
 }
 
 .meter-track {
@@ -564,6 +570,7 @@ body {
 
 .meter-fill {
   height: 100%;
+  width: 0;
   border-radius: 4px;
   transition: width 0.12s linear;
 }
@@ -858,22 +865,17 @@ body {
   flex-wrap: wrap;
 }
 
-.type-select {
-  background: rgba(255, 255, 255, 0.05);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  color: #e6e6ea;
-  border-radius: 9px;
-  padding: 7px 8px;
-  font: inherit;
-  font-size: 11.5px;
-  max-width: 150px;
-  outline: none;
+.question-switch {
+  flex: 0 0 auto;
 }
 
-.type-select:focus {
-  border-color: rgba(74, 222, 128, 0.45);
+.question-menu {
+  top: auto;
+  bottom: calc(100% + 4px);
+  right: auto;
+  left: 0;
+  min-width: 210px;
 }
-
 .answer-preview {
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: 12px;
